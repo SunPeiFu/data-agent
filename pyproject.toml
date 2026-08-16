@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data-agent"
+version = "0.1.0"
+description = "智能数据探查：意图识别与任务拆解 v1"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.25.0",
+  "langchain>=0.2.0",
+  "langgraph>=0.2.0",
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
