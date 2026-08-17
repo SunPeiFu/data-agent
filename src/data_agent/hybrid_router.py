@@ -207,6 +207,8 @@ class PolicyResolver:
             notes=notes,
         )
 
+    # _resolve_scalar 是规则结果和 LLM 结果的“单字段仲裁器”：
+    # 先看有没有候选，再看候选是否一致，不一致时优先 hard rule，然后看置信度差距，差距太小就要求澄清，否则选择置信度最高的候选。
     def _resolve_entities(
         self,
         rule: RulePreAnalysis,
@@ -344,8 +346,10 @@ class PolicyResolver:
         if not candidates:
             return ResolvedField(field_name=field_name, resolution=ConflictResolution.MERGED)
 
+        # 归一化后是一个 比如dwd DWD 归一化后都是dwd
         normalized_values = {_normalize_candidate_value(candidate.value) for candidate in candidates}
         if len(normalized_values) == 1:
+            # 选取置信度最高的一个
             selected = max(candidates, key=lambda item: item.confidence)
             return ResolvedField(
                 field_name=field_name,
@@ -361,6 +365,7 @@ class PolicyResolver:
                 notes=_metadata_validation_notes(field_name, selected),
             )
 
+        # 如果候选值不一致 就进入冲突处理
         hard_rule = next(
             (
                 candidate
@@ -371,6 +376,8 @@ class PolicyResolver:
             ),
             None,
         )
+
+        # 命中强规则 -> 强规则的覆盖llm
         if hard_rule is not None:
             return ResolvedField(
                 field_name=field_name,
@@ -382,7 +389,9 @@ class PolicyResolver:
                 notes=[f"{field_name} 存在冲突，已采用 hard rule 候选。"],
             )
 
+        # 未命中强规则 按照置信度倒序排列取前
         selected, runner_up = sorted(candidates, key=lambda item: item.confidence, reverse=True)[:2]
+        # 倒序前两个的二者之差太小 应该澄清或者由元数据校验 并返回重置的相对较低的置信度
         if selected.confidence - runner_up.confidence < self.policy.conflict_margin:
             return ResolvedField(
                 field_name=field_name,
@@ -394,6 +403,7 @@ class PolicyResolver:
                 notes=[f"{field_name} 候选冲突且置信度接近，后续应澄清或由元数据校验。"],
             )
 
+        # 直接选高置信度的
         return ResolvedField(
             field_name=field_name,
             value=selected.value,

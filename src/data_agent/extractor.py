@@ -45,6 +45,7 @@ def extract_entities_by_rules(question: str) -> ExtractedEntities:
 
 
 def _extract_biz_line(question: str) -> str | None:
+    # next返回第一个迭代遍历中的对象 否则就返回None
     return next((line for line in BUSINESS_LINES if line in question), None)
 
 

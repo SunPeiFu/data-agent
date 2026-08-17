@@ -88,6 +88,7 @@ class LLMQuestionAnalyzer:
 
 用户问题：{question}
 """
+        # 用户问题为什么放最后 让模型建立任务和Json输出约束 在把待解析文本作为输入交给模型 有利于稳定输出结构化结果
         try:
             payload = self.client.chat_json(self.system_prompt, user_prompt)
             return LLMAnalysis.model_validate(payload)
