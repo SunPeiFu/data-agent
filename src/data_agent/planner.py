@@ -7,6 +7,7 @@ from uuid import uuid4
 from langgraph.graph import END, StateGraph
 
 from data_agent.hybrid_router import HybridRouteResult, HybridQuestionRouter
+from data_agent.metadata_repository import MetadataCandidate, MetadataRepositoryError, MySQLMetadataRepository
 from data_agent.models import (
     DataLayer,
     DomainType,
@@ -44,6 +45,7 @@ class PlannerState(TypedDict, total=False):
     post_slot_validation: SlotValidationResult
     planner_decision: str
     metadata_candidates: dict[str, list[str]]
+    metadata_candidate_profiles: dict[str, dict[str, str | None]]
     table_term_candidates: dict[str, list[str]]
     authorized: bool
     trace_id: str
@@ -69,10 +71,12 @@ def create_planning_graph() -> Any:
     # step3 归一化实体 (让进入工具之前的实体完全符合工具要求)
     graph.add_node("normalize_entities", _normalize_entities)
 
-    # step4 元数据解析前槽位校验: 判断用户是否给了足够的表级定位线索
+    # step4 元数据解析前槽位校验: 只基于用户输入和实体抽取结果，判断是否具备最小可执行线索
+    # 典型阻断: 用户只说“查下游”，但没有给表名或表级业务术语
     graph.add_node("validate_slots", _validate_slots)
 
-    # step5 📌mock 元数据候选解析: 后续接 TiDB / 数据目录服务
+    # step5 元数据候选解析: 优先查询 MySQL meta_table/meta_table_ext，失败时使用 mock fallback
+    # 典型转换: userInfo / 订单信息表 -> dwd.userInfo / dim.userInfo / dwd.orderInfo
     graph.add_node("resolve_metadata_candidates", _resolve_metadata_candidates)
 
     # step6 📌 mock 权限和治理校验: 后续接权限系统 / 业务域隔离策略
@@ -201,6 +205,10 @@ def _validate_slots(state: PlannerState) -> PlannerState:
     - 根据配置化 intent slot rule 判断用户是否提供最低可执行线索。
     - 这里只校验“有没有线索”，不判断候选是否唯一，因为真实候选要等元数据解析后才知道。
     - 输出结构化 SlotValidationResult，后续节点可以按 issue_type 做澄清、拒绝或继续执行。
+
+    面试精华：
+    这一步是“前置门禁”，不是查库校验。它的目标是尽早挡住完全不可执行的问题，
+    避免后面浪费元数据查询、血缘查询和模型调用成本。
     """
     intent = state.get("intent", IntentType.UNKNOWN)
     entities = state["entities"]
@@ -209,6 +217,7 @@ def _validate_slots(state: PlannerState) -> PlannerState:
     issues: list[SlotIssue] = []
     notes = [f"槽位预校验: intent={intent.value} 使用配置化 required_any={rule.pre_required_any}。"]
 
+    # intent 都无法判断时，后续无法选择工具模板，只能先澄清用户目标。
     if intent == IntentType.UNKNOWN:
         issues.append(
             _slot_issue(
@@ -217,6 +226,7 @@ def _validate_slots(state: PlannerState) -> PlannerState:
                 message="无法识别用户想查询元数据、血缘关系还是表变更影响。",
             )
         )
+    # required_any 表示“这些槽位满足任意一个即可”。例如血缘查询有 table 或 table_term 即可进入元数据解析。
     elif rule.pre_required_any and not _has_any_slot(rule.pre_required_any, entities, state):
         issues.append(
             _slot_issue(
@@ -245,6 +255,10 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
     - 元数据候选解析完成后，检查表候选是否存在、是否唯一、是否可继续规划。
     - 这一步比 pre_validate 更接近生产，因为它基于元数据服务返回的候选质量做判断。
     - 当前 mock 会用数仓分层先做一次候选过滤，仍无法唯一时才进入澄清分支。
+
+    面试精华：
+    前置校验回答“用户有没有给线索”，后置校验回答“这些线索能不能定位到唯一且一致的真实表”。
+    真实生产里，表存在性、唯一性、主题域/分层一致性通常都放在这一层。
     """
     intent = state.get("intent", IntentType.UNKNOWN)
     entities = state["entities"]
@@ -252,9 +266,11 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
     rule = config.rule_for(intent)
     candidates = state.get("metadata_candidates", {})
     table_candidates = candidates.get("table", [])
+    candidate_profiles = state.get("metadata_candidate_profiles", {})
     issues: list[SlotIssue] = []
     notes = [f"槽位后校验: intent={intent.value} 使用配置化 post_required_any={rule.post_required_any}。"]
 
+    # post_required_any 是元数据解析后的最终要求；表级血缘和影响分析必须已有可执行的表候选。
     if rule.post_required_any and not _has_any_slot(rule.post_required_any, entities, state):
         issues.append(
             _slot_issue(
@@ -264,6 +280,7 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
             )
         )
 
+    # 对血缘/影响分析来说，表候选是硬前提：没有候选不能查 Neo4j，多候选不能静默替用户选择。
     if intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS}:
         if not table_candidates:
             issues.append(
@@ -282,7 +299,8 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
                 )
             )
 
-    issues.extend(_validate_cross_slot_consistency(entities, table_candidates))
+    # 唯一候选表出来后，再检查用户输入的 domain/layer/biz_line 是否和表画像冲突。
+    issues.extend(_validate_cross_slot_consistency(entities, table_candidates, candidate_profiles))
 
     result = SlotValidationResult(
         stage=SlotValidationStage.POST_METADATA,
@@ -294,19 +312,37 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
 
 
 def _resolve_metadata_candidates(state: PlannerState) -> PlannerState:
-    """Mock metadata resolution.
+    """Resolve metadata candidates from MySQL.
 
-    生产中这里应接 TiDB / DataHub / OpenMetadata：
+    当前实现优先查询 MySQL meta_table / meta_table_ext，连接失败时使用 mock fallback 保障本地测试。
+    生产中可平滑替换为 TiDB / DataHub / OpenMetadata：
     - 一段式表名解析成候选 fully qualified name。
     - 两段式/三段式表名校验存在性。
     - 表级业务术语映射到候选物理表。
+
+    面试精华：
+    这个节点不是最终查血缘，也不是最终回答问题，而是把自然语言里的“表线索”
+    转成后续工具能理解的候选资产列表。它是防止 LLM 幻觉表名、误查血缘的关键缓冲层。
     """
     entities = state["entities"]
     candidates: dict[str, list[str]] = {}
+    candidate_profiles: dict[str, dict[str, str | None]] = {}
     notes: list[str] = []
+    repository = MySQLMetadataRepository()
 
+    table_term_candidates = state.get("table_term_candidates", {})
+    table_terms = _table_term_lookup_values(state)
+    # 物理表名路径：用户已经说了 userInfo、dwd.orderInfo、catalog.dwd.orderInfo 等技术表名。
     if entities.table:
-        table_candidates = _mock_table_candidates(entities.table)
+        try:
+            resolved_tables = repository.find_by_table_identifier(entities.table, entities)
+            table_candidates = _candidate_names(resolved_tables)
+            candidate_profiles.update(_candidate_profiles(resolved_tables))
+            notes.append("元数据候选解析: 已通过 MySQL meta_table 查询物理表候选。")
+        except MetadataRepositoryError as exc:
+            table_candidates = _mock_table_candidates(entities.table)
+            candidate_profiles.update(_mock_candidate_profiles(table_candidates))
+            notes.append(f"元数据候选解析: MySQL 查询失败，使用 mock 候选兜底。原因: {exc}")
         table_candidates = _filter_table_candidates_by_context(table_candidates, entities)
         candidates["table"] = table_candidates
         if entities.table.parts_count == 1:
@@ -314,26 +350,47 @@ def _resolve_metadata_candidates(state: PlannerState) -> PlannerState:
         else:
             notes.append(f"元数据候选解析: 表名 {entities.table.raw} 已作为待校验候选。")
 
-    table_term_candidates = state.get("table_term_candidates", {})
+    # 表级业务术语路径：用户说的是“订单信息表”“支付明细表”这类业务叫法，需要映射到候选物理表。
     if table_term_candidates:
-        term_candidates = [table for tables in table_term_candidates.values() for table in tables]
+        try:
+            resolved_terms = repository.find_by_table_terms(table_terms, entities)
+            term_candidates = _candidate_names(resolved_terms)
+            candidate_profiles.update(_candidate_profiles(resolved_terms))
+            notes.append("元数据候选解析: 已通过 MySQL meta_table_ext 查询表级业务术语候选。")
+        except MetadataRepositoryError as exc:
+            term_candidates = [table for tables in table_term_candidates.values() for table in tables]
+            candidate_profiles.update(_mock_candidate_profiles(term_candidates))
+            notes.append(f"元数据候选解析: MySQL 术语查询失败，使用配置候选兜底。原因: {exc}")
         existing = candidates.get("table", [])
+        # 如果用户同时给了分层，例如 DWD 层，就先用上下文缩小候选范围。
         merged_candidates = _filter_table_candidates_by_context(
             _merge_preserve_order([*existing, *term_candidates]),
             entities,
         )
         candidates["table"] = merged_candidates
         notes.append(f"元数据候选解析: table_terms 命中候选表 {table_term_candidates}。")
+        # 唯一候选可以回填到 entities.table，后续 task_builder 才能生成确定的工具参数。
         if entities.table is None and len(merged_candidates) == 1:
             entities = entities.model_copy(update={"table": TableIdentifier.parse(merged_candidates[0])})
             notes.append(f"元数据候选解析: 唯一候选表 {merged_candidates[0]} 已回填到实体。")
+        # 多候选不能自动选择，否则可能查错血缘；交给 post_validate_slots 触发澄清。
         elif entities.table is None and len(merged_candidates) > 1:
             notes.append("元数据候选解析: 多个候选表未自动选择，等待澄清或真实元数据排序。")
 
     if not notes:
         notes.append("元数据候选解析: 当前问题无需表候选解析。")
 
-    return {"entities": entities, "metadata_candidates": candidates, "metadata_notes": notes}
+    candidate_profiles = {
+        table_name: profile
+        for table_name, profile in candidate_profiles.items()
+        if table_name in candidates.get("table", [])
+    }
+    return {
+        "entities": entities,
+        "metadata_candidates": candidates,
+        "metadata_candidate_profiles": candidate_profiles,
+        "metadata_notes": notes,
+    }
 
 
 def _authorize_context(state: PlannerState) -> PlannerState:
@@ -673,6 +730,11 @@ def _has_cycle(result: PlanningResult) -> bool:
 
 
 def _mock_table_candidates(table: TableIdentifier) -> list[str]:
+    """Generate mock table candidates for local study and tests.
+
+    一段式表名天然不唯一，例如 userInfo 可能同时存在于 dwd 和 dim；
+    两段式/三段式表名已经携带 schema/catalog，当前 mock 直接作为候选返回。
+    """
     if table.parts_count == 1:
         return [f"dwd.{table.table_name}", f"dim.{table.table_name}"]
     return [table.raw]
@@ -683,6 +745,11 @@ def _filter_table_candidates_by_context(candidates: list[str], entities: Extract
 
     当前先用 data_layer 做最小可解释消歧：`userInfo + DWD` 会优先收敛到
     `dwd.userInfo`。真实生产里这里会改成 TiDB/DataCatalog 的评分和排序结果。
+
+    设计原则：
+    - 能用明确上下文缩小候选就缩小，降低澄清率。
+    - 如果上下文过滤不到结果，就保留原候选，交给 post_validate_slots 判断是否冲突。
+    - 不在这里“拍脑袋选一个”，避免错误血缘分析。
     """
     if not entities.data_layer:
         return candidates
@@ -701,7 +768,58 @@ MOCK_TABLE_PROFILES: dict[str, dict[str, str]] = {
 }
 
 
-def _validate_cross_slot_consistency(entities: ExtractedEntities, table_candidates: list[str]) -> list[SlotIssue]:
+def _candidate_names(candidates: list[MetadataCandidate]) -> list[str]:
+    """Convert repository candidates to the table-name list used by PlannerState.
+
+    原子职责：
+    PlannerState 里保留轻量的 `metadata_candidates["table"] = list[str]`，
+    便于 post_validate_slots 判断候选数量，也便于最终 notes 展示。
+    """
+    return _merge_preserve_order([candidate.full_table_name for candidate in candidates])
+
+
+def _candidate_profiles(candidates: list[MetadataCandidate]) -> dict[str, dict[str, str | None]]:
+    """Convert repository candidates to profile map for post slot validation.
+
+    原子职责：
+    候选名只解决“有哪些表”，profile 解决“这些表属于哪个域/分层/业务线”。
+    post_validate_slots 会用 profile 做跨槽位一致性校验。
+    """
+    return {candidate.full_table_name: candidate.profile() for candidate in candidates}
+
+
+def _mock_candidate_profiles(candidates: list[str]) -> dict[str, dict[str, str | None]]:
+    """Build profile map for fallback mock candidates.
+
+    原子职责：
+    当 MySQL 不可用时，mock 候选也要能参与一致性校验，否则测试和本地学习会丢失
+    domain/data_layer/biz_line 冲突判断。
+    """
+    return {candidate: MOCK_TABLE_PROFILES[candidate] for candidate in candidates if candidate in MOCK_TABLE_PROFILES}
+
+
+def _table_term_lookup_values(state: PlannerState) -> list[str]:
+    """Build MySQL lookup values from normalized table terms.
+
+    meta_table_ext supports both normalized_term and term_value, so this method passes both
+    canonical terms such as order_info and raw user terms such as 订单信息表.
+
+    原子职责：
+    normalize_entities 会产出 `订单信息表 -> order_info`。真实查询时不能只查 canonical，
+    因为元数据字典里可能只维护了原始别名；也不能只查原词，因为生产词典可能只存标准术语。
+    """
+    values = list(state.get("table_term_candidates", {}).keys())
+    for term in state.get("normalized_terms", []):
+        if term.term_type == NormalizedTermType.TABLE_TERM:
+            values.extend([term.text, term.canonical])
+    return _merge_preserve_order(values)
+
+
+def _validate_cross_slot_consistency(
+    entities: ExtractedEntities,
+    table_candidates: list[str],
+    candidate_profiles: dict[str, dict[str, str | None]],
+) -> list[SlotIssue]:
     """Validate consistency between user slots and resolved table profile.
 
     真实企业里，这一步会读取元数据服务返回的表画像：
@@ -711,12 +829,16 @@ def _validate_cross_slot_consistency(entities: ExtractedEntities, table_candidat
 
     当前用 mock profile 表达同样的生产逻辑：如果用户说“营销域”，但唯一候选表画像是
     “交易域”，就不能继续生成计划，必须先澄清或修正。
+
+    注意：
+    只有唯一候选表时才做一致性校验。多候选情况下，每个候选可能属于不同域/层级，
+    这时优先让用户消歧，而不是提前判断冲突。
     """
     if len(table_candidates) != 1:
         return []
 
     table_name = table_candidates[0]
-    profile = MOCK_TABLE_PROFILES.get(table_name)
+    profile = candidate_profiles.get(table_name) or MOCK_TABLE_PROFILES.get(table_name)
     if not profile:
         return []
 
@@ -749,7 +871,12 @@ def _validate_cross_slot_consistency(entities: ExtractedEntities, table_candidat
 
 
 def _slot_issue(slot_name: str, issue_type: SlotIssueType, message: str) -> SlotIssue:
-    """Create a slot issue using configured blocking policy."""
+    """Create a slot issue using configured blocking policy.
+
+    原子职责：
+    把“发现了什么问题”统一包装成结构化 SlotIssue。是否阻断不写死在调用方，
+    而是读取 slot_rules.yml，方便生产里按业务线调整策略。
+    """
     return SlotIssue(
         slot_name=slot_name,
         issue_type=issue_type,
@@ -759,11 +886,24 @@ def _slot_issue(slot_name: str, issue_type: SlotIssueType, message: str) -> Slot
 
 
 def _has_any_slot(slot_names: list[str], entities: ExtractedEntities, state: PlannerState) -> bool:
-    """Check whether at least one configured slot has a usable value."""
+    """Check whether at least one configured slot has a usable value.
+
+    原子职责：
+    支持 required_any 语义。比如 lineage_search 的前置要求是 table 或 table_term
+    二选一，只要其中一个存在，就允许进入元数据候选解析。
+    """
     return any(_slot_has_value(slot_name, entities, state) for slot_name in slot_names)
 
 
 def _slot_has_value(slot_name: str, entities: ExtractedEntities, state: PlannerState) -> bool:
+    """Return whether a single slot is present and usable.
+
+    原子职责：
+    把配置里的字符串槽位名映射到真实数据来源：
+    - intent/table/topic_keywords 来自 entities 或 state。
+    - table_term 来自 normalize_entities 产出的 table_term_candidates。
+    - table 在 post 阶段可以来自 metadata_candidates，表示已经解析出候选表。
+    """
     if slot_name == "intent":
         return state.get("intent") not in {None, IntentType.UNKNOWN}
     if slot_name == "table_term":
@@ -777,6 +917,12 @@ def _slot_has_value(slot_name: str, entities: ExtractedEntities, state: PlannerS
 
 
 def _missing_slot_message(intent: IntentType) -> str:
+    """Build user-facing missing-slot message by intent.
+
+    原子职责：
+    不同 intent 缺槽位时，应该问的问题不一样。血缘查询重点补表名；
+    元数据搜索可以补主题域、分层、表名或业务关键词。
+    """
     messages = {
         IntentType.METADATA_SEARCH: "缺少主题域、数仓分层、表名、表级业务术语或业务关键词，无法执行元数据搜索。",
         IntentType.LINEAGE_SEARCH: "缺少表名或表级业务术语，血缘查询无法定位数据资产。",
@@ -787,6 +933,12 @@ def _missing_slot_message(intent: IntentType) -> str:
 
 
 def _slot_issue_notes(prefix: str, issues: list[SlotIssue]) -> list[str]:
+    """Convert structured slot issues into readable notes.
+
+    原子职责：
+    SlotIssue 给系统做决策，notes 给人阅读和面试演示。这里把 issue_type、
+    slot_name、blocking、message 都展开，方便追踪为什么进入澄清分支。
+    """
     if not issues:
         return [f"{prefix}: 通过。"]
     return [
@@ -796,6 +948,11 @@ def _slot_issue_notes(prefix: str, issues: list[SlotIssue]) -> list[str]:
 
 
 def _slot_validation_notes(state: PlannerState) -> list[str]:
+    """Collect pre/post slot validation notes in execution order.
+
+    原子职责：
+    最终 PlanningResult.notes 需要按流程展示，所以这里统一收集前置校验和后置校验的说明。
+    """
     notes: list[str] = []
     for key in ["pre_slot_validation", "post_slot_validation"]:
         validation = state.get(key)
@@ -805,6 +962,11 @@ def _slot_validation_notes(state: PlannerState) -> list[str]:
 
 
 def _all_slot_issues(state: PlannerState) -> list[SlotIssue]:
+    """Collect blocking slot issues from pre/post validation.
+
+    原子职责：
+    澄清节点只关心阻断型问题。非阻断问题可以留在 notes 中提示，但不影响继续规划。
+    """
     return [
         issue
         for key in ["pre_slot_validation", "post_slot_validation"]
@@ -814,6 +976,12 @@ def _all_slot_issues(state: PlannerState) -> list[SlotIssue]:
 
 
 def _build_clarification_question(issues: list[SlotIssue]) -> str:
+    """Build the clarification question shown to the user.
+
+    原子职责：
+    把系统内部的 SlotIssue 转成用户能直接回复的问题。ambiguous 要求用户选唯一表，
+    missing 要求用户补表名或业务术语，conflict 直接说明冲突点。
+    """
     if not issues:
         return "请补充更明确的数据资产信息。"
     first_issue = issues[0]

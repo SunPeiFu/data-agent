@@ -1,5 +1,8 @@
 intents:
   metadata_search:
+    # pre_required_any: 元数据解析前的最低信息要求；满足其中任意一个槽位即可进入候选解析。
+    # post_required_any: 元数据解析后的最终执行要求；用于确认是否已经具备可执行资产。
+    # blocking_issue_types: 定义哪些问题会触发澄清、拒绝或中断后续工具计划。
     pre_required_any:
       - domain
       - data_layer
@@ -25,9 +28,15 @@ intents:
     post_required_any: []
 
 blocking_issue_types:
+  # 缺少必要槽位，例如血缘查询没有表名或表级业务术语。
   - missing
+  # 存在歧义，例如“订单信息表”解析出多张候选表。
   - ambiguous
+  # 槽位值非法，例如不存在的层级或不合法的表名格式。
   - invalid
+  # 槽位冲突，例如用户说“营销域”，但候选表真实属于“交易域”。
   - conflict
+  # 权限不允许，例如用户没有权限查看某张表或某个业务域。
   - forbidden
+  # 置信度过低，例如 LLM 和规则都不能稳定判断用户意图。
   - low_confidence
