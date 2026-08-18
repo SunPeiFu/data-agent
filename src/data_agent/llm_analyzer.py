@@ -55,14 +55,14 @@ class LLMQuestionAnalyzer:
 - lineage_direction: upstream | downstream | both | null
 
 判断准则：
-- 查表、字段、表说明、业务含义、某主题下有哪些表 => metadata_search
+- 查表、表说明、业务含义、某主题下有哪些表 => metadata_search
 - 查上游、下游、依赖、血缘，且没有变更动作 => lineage_search
-- 出现字段修改、新增、删除、重命名、表变更、影响范围 => impact_analysis
+- 出现表修改、表变更、字段修改、影响范围 => impact_analysis；当前 planner 先统一生成表级影响计划
 - 上游和下游同时出现 => lineage_direction=both
 - 只出现上游/来源 => lineage_direction=upstream
 - 只出现下游/影响哪些表/产生影响 => lineage_direction=downstream
 - 表名必须尽量抽取原始表达，支持三段式、两段式、一段式，例如 catalog.dwd.orderInfo、dwd.orderInfo、userInfo
-- 字段名只有用户明确给出具体字段时才填写；用户只说“字段修改”时 field_name=null
+- field_name 为后续字段级扩展预留；当前表级探查阶段，用户只说“字段修改”时 field_name=null
 - topic_keywords 只放业务主题词，例如 支付、订单、用户、营销、风控，不要放主题域或数仓分层
 """
 

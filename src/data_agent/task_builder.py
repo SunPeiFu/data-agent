@@ -19,20 +19,17 @@ def build_task_plan(question: str, intent: IntentType, confidence: float, entiti
         steps = _lineage_steps(entities)
     elif intent == IntentType.IMPACT_ANALYSIS:
         steps = _impact_steps(entities)
-        if entities.operation and entities.field_name is None:
-            notes.append("用户未提供具体字段名，v1 默认降级为表级影响分析；提供字段名后可进一步收敛到字段级血缘。")
-
-    need_clarification, clarification_question = _validate_slots(intent, entities)
-    adjusted_confidence = confidence if not need_clarification else min(confidence, 0.62)
+        if entities.operation:
+            notes.append("当前版本聚焦表级数据探查，变更影响分析统一按表级血缘生成计划。")
 
     return PlanningResult(
         question=question,
         intent=intent,
-        confidence=adjusted_confidence,
+        confidence=confidence,
         entities=entities,
         task_steps=steps,
-        need_clarification=need_clarification,
-        clarification_question=clarification_question,
+        need_clarification=False,
+        clarification_question=None,
         notes=notes,
     )
 
@@ -50,7 +47,7 @@ def _metadata_steps(entities: ExtractedEntities) -> list[TaskStep]:
             _enum_value(entities.domain),
             _enum_value(entities.data_layer),
             *entities.topic_keywords,
-            "相关表 表说明 字段含义",
+            "相关表 表说明 业务含义",
         ]
         if item
         # 代码的逻辑 把用户问题里抽取到的业务线、主题域、数仓层级、关键词，拼成一个更适合 Milvus/RAG 语义检索的查询句子
@@ -99,7 +96,7 @@ def _impact_steps(entities: ExtractedEntities) -> list[TaskStep]:
             _enum_value(entities.domain),
             _enum_value(entities.data_layer),
             *entities.topic_keywords,
-            "表说明 字段含义 业务影响",
+            "表说明 业务影响",
         ]
         if item
     )
@@ -111,10 +108,9 @@ def _impact_steps(entities: ExtractedEntities) -> list[TaskStep]:
             action="lineage_search",
             params={
                 "table": _table_raw(entities),
-                "field_name": entities.field_name,
                 "direction": direction.value,
                 "depth": 3,
-                "lineage_granularity": "field" if entities.field_name else "table",
+                "lineage_granularity": "table",
             },
             depends_on=[1],
             parallel_group="after_table_resolved",
@@ -166,16 +162,6 @@ def _resolve_table_step(entities: ExtractedEntities, step_id: int) -> TaskStep:
             "table_parts_count": entities.table.parts_count if entities.table else None,
         },
     )
-
-
-def _validate_slots(intent: IntentType, entities: ExtractedEntities) -> tuple[bool, str | None]:
-    if intent == IntentType.UNKNOWN:
-        return True, "请补充你想查询元数据、血缘关系，还是字段/表变更影响。"
-    if intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS} and entities.table is None:
-        return True, "请补充要分析的表名，例如 dwd.orderInfo 或 userInfo。"
-    if intent == IntentType.METADATA_SEARCH and not any([entities.domain, entities.data_layer, entities.topic_keywords, entities.table]):
-        return True, "请补充主题域、数仓分层、表名或业务关键词。"
-    return False, None
 
 
 def _enum_value(value: object) -> str | None:

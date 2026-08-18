@@ -30,9 +30,9 @@ pytest -q
 ```bash
 python -m data_agent.cli plan "安逸花业务线营销域下DWD层关于支付的表有哪些"
 
-python -m data_agent.cli plan "安逸花 dwd 层 dwd.orderInfo 中的字段修改，对下游哪些表产生影响"
+python -m data_agent.cli plan "安逸花 dwd 层 dwd.orderInfo 表修改，对下游哪些表产生影响"
 
-python -m data_agent.cli plan "营销域下的 dwd层的userInfo表修改字段，关联影响的上游和下游表有哪些"
+python -m data_agent.cli plan "营销域下的 dwd层的userInfo表修改，关联影响的上游和下游表有哪些"
 ```
 
 你先不要看源码，只观察输出里的三个字段：
@@ -68,7 +68,7 @@ docs/design.md
 必须背下来的面试表达：
 
 ```text
-这个项目不是把用户问题直接丢给大模型回答，而是先通过 Agent Planner 识别意图、抽取实体、生成工具调用计划。TiDB 用来查结构化元数据，Milvus 用来补充表和字段的业务语义，Neo4j 用来做确定性的血缘关系查询。
+这个项目不是把用户问题直接丢给大模型回答，而是先通过 Agent Planner 识别意图、抽取实体、生成工具调用计划。TiDB 用来查结构化元数据，Milvus 用来补充表说明和业务语义，Neo4j 用来做确定性的血缘关系查询。
 ```
 
 这一小时不要深挖代码，先确保能讲清楚“为什么这样做”。
@@ -143,7 +143,7 @@ src/data_agent/classifier.py
 
 只记三条规则：
 
-- “有哪些表 / 表说明 / 字段含义” -> `metadata_search`
+- “有哪些表 / 表说明 / 业务含义” -> `metadata_search`
 - “上游 / 下游 / 依赖 / 血缘” -> `lineage_search`
 - “修改字段 / 变更 / 影响” -> `impact_analysis`
 
@@ -164,7 +164,7 @@ src/data_agent/extractor.py
 你要讲清楚：
 
 ```text
-意图识别负责判断用户想干什么，实体抽取负责把问题里的业务线、主题域、数仓分层、表名、字段名、操作类型和血缘方向提取出来。
+意图识别负责判断用户想干什么，实体抽取负责把问题里的业务线、主题域、数仓分层、表名、操作类型和血缘方向提取出来。当前学习阶段先聚焦表级数据探查。
 ```
 
 快速练习：
@@ -174,7 +174,7 @@ python - <<'PY'
 from data_agent.classifier import RuleBasedIntentClassifier
 from data_agent.extractor import extract_entities
 
-q = "营销域下的 dwd层的userInfo表修改字段，关联影响的上游和下游表有哪些"
+q = "营销域下的 dwd层的userInfo表修改，关联影响的上游和下游表有哪些"
 print(RuleBasedIntentClassifier().classify(q))
 print(extract_entities(q).model_dump())
 PY
@@ -236,7 +236,7 @@ TiDB 负责结构化过滤业务线、主题域、分层；Milvus 负责语义�
 用户问：
 
 ```text
-安逸花 dwd 层 dwd.orderInfo 中的字段修改，对下游哪些表产生影响
+安逸花 dwd 层 dwd.orderInfo 表修改，对下游哪些表产生影响
 ```
 
 计划：
@@ -258,7 +258,7 @@ impact_analyzer.classify_impact
 用户问：
 
 ```text
-营销域下的 dwd层的userInfo表修改字段，关联影响的上游和下游表有哪些
+营销域下的 dwd层的userInfo表修改，关联影响的上游和下游表有哪些
 ```
 
 计划：
@@ -299,14 +299,18 @@ classify_intent
   -> extract_entities
   -> normalize_entities
   -> validate_slots
-  -> build_task_plan
+  -> resolve_metadata_candidates
+  -> authorize_context
+  -> post_validate_slots
+  -> decide_clarification_or_continue
+  -> build_task_plan | return_clarification_result | return_forbidden_result
   -> return_planning_result
 ```
 
 面试讲法：
 
 ```text
-我用 LangGraph 把 Agent Planner 显式建模成状态图。v1 先完成规划链路，后续可以继续接真实工具执行、失败重试、人机澄清、trace 日志和并行节点。
+我用 LangGraph 把 Agent Planner 显式建模成状态图。当前版本已经把槽位校验、元数据候选解析、权限校验和澄清决策拆成独立节点，并通过 conditional edge 控制继续规划、澄清或拒绝；后续可以继续接真实工具执行、失败重试、trace 日志和并行节点。
 ```
 
 不要在这一小时纠结 LangGraph 高级语法。面试里重点不是炫框架，而是说明你知道为什么用状态图组织 Agent 流程。
@@ -348,9 +352,9 @@ pytest -q
 你要反复练这段：
 
 ```text
-我做的是一个面向数据资产探查的 Agent Planner。用户输入自然语言后，系统先做意图识别，区分元数据查询、血缘查询和变更影响分析；然后做实体抽取，提取业务线、主题域、数仓分层、表名、字段名、操作类型和血缘方向；最后由任务拆解模块生成工具调用计划。
+我做的是一个面向数据资产探查的 Agent Planner。用户输入自然语言后，系统先做意图识别，区分元数据查询、血缘查询和变更影响分析；然后做实体抽取，提取业务线、主题域、数仓分层、表名、操作类型和血缘方向；最后由任务拆解模块生成工具调用计划。
 
-比如用户问“营销域下的 DWD 层 userInfo 表修改字段，关联影响的上游和下游表有哪些”，系统会识别为 impact_analysis，direction 是 both。因为 userInfo 是一段式表名，所以第一步必须调用 TiDB 元数据工具 resolve_table；表定位后调用 Neo4j 的 lineage_search(direction=both) 查双向血缘，同时调用 Milvus 做表说明和字段业务语义召回，最后由 impact_analyzer 合并血缘和元数据语义。
+比如用户问“营销域下的 DWD 层 userInfo 表修改，关联影响的上游和下游表有哪些”，系统会识别为 impact_analysis，direction 是 both。因为 userInfo 是一段式表名，所以第一步必须调用 TiDB 元数据工具 resolve_table；表定位后调用 Neo4j 的 lineage_search(direction=both) 查双向血缘，同时调用 Milvus 做表说明和业务语义召回，最后由 impact_analyzer 合并血缘和元数据语义。
 ```
 
 再准备 5 个追问答案。
@@ -358,7 +362,7 @@ pytest -q
 ### 追问 1：为什么不是纯 RAG？
 
 ```text
-因为血缘关系是确定性图关系，不能靠向量召回猜。RAG 适合补充表说明、字段含义和业务语义，Neo4j 才适合查上下游依赖。
+因为血缘关系是确定性图关系，不能靠向量召回猜。RAG 适合补充表说明和业务语义，Neo4j 才适合查上下游依赖。
 ```
 
 ### 追问 2：为什么上游下游不是两个 intent？
@@ -373,10 +377,10 @@ pytest -q
 因为 userInfo 这种一段式表名在不同库、不同分层、不同主题域下可能重复。必须结合业务线、主题域、数仓分层先定位候选表，避免直接查错血缘。
 ```
 
-### 追问 4：字段名没给怎么办？
+### 追问 4：为什么当前先做表级？
 
 ```text
-如果用户说字段修改但没有给字段名，系统会降级成表级影响分析，并在 notes 里提示提供字段名后可以进一步收敛到字段级血缘。
+表级探查是数据地图最核心的入口，能先解决表定位、表说明、上下游血缘和表变更影响。字段级血缘依赖字段字典、字段映射和更细粒度的血缘数据，复杂度更高，所以当前版本先把表级链路做稳，字段级作为后续演进。
 ```
 
 ### 追问 5：为什么用 LangGraph？

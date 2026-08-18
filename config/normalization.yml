@@ -1,0 +1,46 @@
+stopwords:
+  - 表
+  - 表说明
+  - 相关表
+  - 血缘
+  - 上游
+  - 下游
+  - 影响
+
+synonyms:
+    # 标准名称
+  - canonical: 支付
+    term_type: business_term
+    aliases: [支付相关, 支付业务, 付款]
+    confidence: 0.9
+  - canonical: 订单
+    term_type: business_term
+    aliases: [订单信息, 订单明细, order]
+    confidence: 0.88
+  - canonical: 用户
+    term_type: entity
+    aliases: [客户, user]
+    confidence: 0.86
+
+table_terms:
+  - canonical: order_info
+    display_name: 订单信息
+    aliases: [订单信息表, 订单明细表, orderInfo]
+    candidate_tables: [dwd.orderInfo, dwd.order_info]
+    domain: 交易域
+    preferred_layer: DWD
+    confidence: 0.9
+  - canonical: payment_detail
+    display_name: 支付明细
+    aliases: [支付明细表, 支付流水表, 支付记录表]
+    candidate_tables: [dwd.payment_detail, dwd.pay_record]
+    domain: 营销域
+    preferred_layer: DWD
+    confidence: 0.9
+  - canonical: user_info
+    display_name: 用户信息
+    aliases: [用户信息表, 用户资料表, userInfo]
+    candidate_tables: [dwd.userInfo, dim.userInfo]
+    domain: 用户域
+    preferred_layer: DWD
+    confidence: 0.88

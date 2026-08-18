@@ -106,7 +106,7 @@ class EntityMergePolicy(BaseModel):
     """字段级合并策略。
 
     真实生产中不同字段的可信来源不同：
-    枚举/方向/操作更适合 hard rule，表名/字段名更适合作为候选交给元数据校验。
+    枚举/方向/操作更适合 hard rule，表名更适合作为候选交给元数据校验。
     """
 
     hard_rule_fields: set[str] = Field(
@@ -118,8 +118,8 @@ class EntityMergePolicy(BaseModel):
             "data_layer",
         }
     )
-    metadata_validated_fields: set[str] = Field(default_factory=lambda: {"table", "field_name"})
-    llm_semantic_fields: set[str] = Field(default_factory=lambda: {"table", "field_name", "topic_keywords"})
+    metadata_validated_fields: set[str] = Field(default_factory=lambda: {"table"})
+    llm_semantic_fields: set[str] = Field(default_factory=lambda: {"table", "topic_keywords"})
     conflict_margin: float = 0.12
 
 
@@ -218,7 +218,7 @@ class PolicyResolver:
         """逐字段生成候选并完成决策。
 
         企业级实体合并的关键点是“按字段决策”，而不是全局 rule 优先或 LLM 优先。
-        例如 operation/direction 是 hard rule，table/field_name 是候选并需要元数据校验。
+        例如 operation/direction 是 hard rule，table 是候选并需要元数据校验。
         """
         fields = {
             "intent": self._resolve_scalar(
@@ -596,7 +596,7 @@ def _normalize_candidate_value(value: Any) -> str:
 def _metadata_validation_notes(field_name: str, selected: FieldCandidate) -> list[str]:
     """为需要元数据确认的字段生成备注。
 
-    table 和 field_name 即使被选中，也只是候选值，后续必须由 TiDB 元数据服务确认。
+    table 即使被选中，也只是候选值，后续必须由 TiDB 元数据服务确认。
     """
     if selected.requires_metadata_validation:
         return [f"{field_name} 已作为候选值选中，后续必须通过元数据服务校验。"]

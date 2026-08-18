@@ -1,0 +1,33 @@
+intents:
+  metadata_search:
+    pre_required_any:
+      - domain
+      - data_layer
+      - topic_keywords
+      - table
+      - table_term
+    post_required_any: []
+  lineage_search:
+    pre_required_any:
+      - table
+      - table_term
+    post_required_any:
+      - table
+  impact_analysis:
+    pre_required_any:
+      - table
+      - table_term
+    post_required_any:
+      - table
+  unknown:
+    pre_required_any:
+      - intent
+    post_required_any: []
+
+blocking_issue_types:
+  - missing
+  - ambiguous
+  - invalid
+  - conflict
+  - forbidden
+  - low_confidence

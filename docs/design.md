@@ -14,9 +14,11 @@ v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它
   -> validate_slots
   -> resolve_metadata_candidates
   -> authorize_context
+  -> post_validate_slots
   -> decide_clarification_or_continue
-  -> build_task_plan
-  -> validate_task_plan
+  -> build_task_plan -> validate_task_plan
+     | return_clarification_result
+     | return_forbidden_result
   -> attach_trace
   -> PlanningResult JSON
 ```
@@ -25,11 +27,14 @@ v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它
 
 - `classify_intent`：通过 Hybrid Router 先做规则预分析，再调用 OpenAI-compatible LLM 做结构化解析，最后用策略合并结果。
 - `extract_entities`：直接消费 Hybrid Router 合并后的实体结果；无模型或模型输出不合法时使用规则预分析兜底。
-- `normalize_entities`：标准化 LLM/规则抽取出的实体，包括表名 schema/catalog 大小写、字段名展示字符、topic_keywords 去重去噪、主题域/数仓分层词剔除，并记录归一化 notes。
-- `validate_slots`：检查关键槽位是否缺失。
-- `resolve_metadata_candidates`：mock 解析表名/字段名候选；后续接 TiDB / DataHub / OpenMetadata 等元数据服务。
-- `authorize_context`：mock 权限和治理校验；后续接权限系统、敏感字段策略、业务域隔离。
-- `decide_clarification_or_continue`：根据缺槽位、多候选、权限状态决定是否需要澄清；v1 先写入 notes 并继续生成计划。
+- `normalize_entities`：标准化 LLM/规则抽取出的实体，包括表名 schema/catalog 大小写、表级业务术语、topic_keywords 去重去噪、主题域/数仓分层词剔除，并记录归一化 notes。
+- `validate_slots`：元数据解析前槽位校验，根据 `config/slot_rules.yml` 判断用户是否提供最低可执行线索。
+- `resolve_metadata_candidates`：mock 解析表名和表级业务术语候选；后续接 TiDB / DataHub / OpenMetadata 等元数据服务。
+- `authorize_context`：mock 权限和治理校验；后续接权限系统、业务域隔离和审计策略。
+- `post_validate_slots`：元数据解析后槽位校验，判断候选表是否存在、是否唯一、是否可继续规划。
+- `decide_clarification_or_continue`：根据结构化 `SlotValidationResult` 和权限状态输出 `continue`、`clarify` 或 `forbidden`，由 LangGraph conditional edge 控制后续分支。
+- `return_clarification_result`：缺槽位或多候选时返回澄清问题，不生成工具计划。
+- `return_forbidden_result`：无权限时返回拒绝结果，不生成工具计划。
 - `build_task_plan`：生成 TiDB、Milvus、Neo4j、impact analyzer 的工具调用计划。
 - `validate_task_plan`：mock 校验工具名、步骤依赖和计划结构。
 - `attach_trace`：附加 trace_id、planner_version、intent/confidence 等审计信息。
@@ -39,7 +44,7 @@ v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它
 
 - `tidb_metadata.filter_tables`：按业务线、主题域、分层、关键词过滤表。
 - `tidb_metadata.resolve_table`：解析一段式、两段式、三段式表名，定位候选表。
-- `milvus_rag.semantic_search`：召回表说明、字段含义、业务语义。
+- `milvus_rag.semantic_search`：召回表说明和业务语义。
 - `neo4j_lineage.lineage_search`：通过 `direction` 参数控制上游、下游、双向血缘。
 - `impact_analyzer.classify_impact`：对单向影响范围分级。
 - `impact_analyzer.merge_lineage_and_metadata`：融合血缘和元数据语义。
@@ -60,7 +65,7 @@ RulePreAnalyzer
   -> HybridRouteResult
 ```
 
-规则预分析负责识别高确定性约束，例如字段变更、上下游方向、枚举值和明显表名。LLM 负责理解自然语言和补充弱语义实体。`PolicyResolver` 不再使用简单的固定优先级，而是把规则和 LLM 都转成字段候选：
+规则预分析负责识别高确定性约束，例如表变更、上下游方向、枚举值和明显表名。LLM 负责理解自然语言和补充弱语义实体。`PolicyResolver` 不再使用简单的固定优先级，而是把规则和 LLM 都转成字段候选：
 
 ```text
 RuleEvidence
@@ -69,7 +74,7 @@ RuleEvidence
   -> EntityResolution
 ```
 
-每个候选都包含 source、confidence、strength、reason、是否需要元数据校验。`domain`、`data_layer`、`operation`、`lineage_direction` 这类高确定性字段优先采用 hard rule；`table` 和 `field_name` 会被标记为候选值，后续必须通过 TiDB 元数据服务做 `resolve_table` / `check_field` 确认；冲突接近时会标记为 `needs_clarification`。
+每个候选都包含 source、confidence、strength、reason、是否需要元数据校验。`domain`、`data_layer`、`operation`、`lineage_direction` 这类高确定性字段优先采用 hard rule；`table` 会被标记为候选值，后续必须通过 TiDB 元数据服务做 `resolve_table` 确认；冲突接近时会标记为 `needs_clarification`。当前版本先聚焦表级探查，字段级血缘后续再扩展。
 
 环境变量：
 

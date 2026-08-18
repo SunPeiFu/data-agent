@@ -43,6 +43,69 @@ class OperationType(str, Enum):
     UNKNOWN_CHANGE = "unknown_change"
 
 
+class NormalizedTermType(str, Enum):
+    BUSINESS_TERM = "business_term"
+    METRIC = "metric"
+    ENTITY = "entity"
+    TABLE_TERM = "table_term"
+
+
+class NormalizedTerm(BaseModel):
+    text: str
+    canonical: str
+    term_type: NormalizedTermType
+    source: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class NormalizationTrace(BaseModel):
+    field_name: str
+    before: Any
+    after: Any
+    rule: str
+    source: str
+
+
+class SlotIssueType(str, Enum):
+    MISSING = "missing"
+    AMBIGUOUS = "ambiguous"
+    INVALID = "invalid"
+    CONFLICT = "conflict"
+    FORBIDDEN = "forbidden"
+    LOW_CONFIDENCE = "low_confidence"
+
+
+class SlotValidationStage(str, Enum):
+    PRE_METADATA = "pre_metadata"
+    POST_METADATA = "post_metadata"
+
+
+class SlotIssue(BaseModel):
+    slot_name: str
+    issue_type: SlotIssueType
+    message: str
+    blocking: bool = True
+
+
+class SlotValidationResult(BaseModel):
+    stage: SlotValidationStage
+    passed: bool = True
+    issues: list[SlotIssue] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+    @property
+    def blocking_issues(self) -> list[SlotIssue]:
+        return [issue for issue in self.issues if issue.blocking]
+
+    @property
+    def needs_clarification(self) -> bool:
+        return any(issue.issue_type != SlotIssueType.FORBIDDEN for issue in self.blocking_issues)
+
+    @property
+    def forbidden(self) -> bool:
+        return any(issue.issue_type == SlotIssueType.FORBIDDEN for issue in self.blocking_issues)
+
+
 class TableIdentifier(BaseModel):
     raw: str # raw含义 原始输入字符串 没有任何更新更改
     catalog: str | None = None
@@ -99,3 +162,5 @@ class PlanningResult(BaseModel):
     need_clarification: bool = False
     clarification_question: str | None = None
     notes: list[str] = Field(default_factory=list)
+    normalized_terms: list[NormalizedTerm] = Field(default_factory=list)
+    normalization_traces: list[NormalizationTrace] = Field(default_factory=list)

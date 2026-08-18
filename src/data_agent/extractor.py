@@ -58,6 +58,9 @@ def _extract_domain(question: str) -> DomainType | None:
 
 def _extract_layer(question: str) -> DataLayer | None:
     upper_question = question.upper()
+    explicit_layer = re.search(r"\b(ODS|DWD|DWS|ADS|DIM)\b\s*层", upper_question)
+    if explicit_layer:
+        return DataLayer(explicit_layer.group(1))
     for layer in DataLayer:
         if layer.value in upper_question:
             return layer
@@ -100,7 +103,7 @@ def _extract_operation(question: str) -> OperationType | None:
         return OperationType.DELETE_FIELD
     if "重命名字段" in question or "字段重命名" in question:
         return OperationType.RENAME_FIELD
-    if "修改字段" in question or "字段修改" in question or re.search(r"字段\s*[A-Za-z_][\w]*\s*修改", question):
+    if "修改字段" in question or "字段修改" in question or re.search(r"字段\s*[\w\u4e00-\u9fff]+\s*修改", question):
         return OperationType.MODIFY_FIELD
     if "变更" in question or "影响" in question:
         return OperationType.UNKNOWN_CHANGE

@@ -4,7 +4,7 @@ from data_agent.planner import plan_question
 
 
 def test_data_catalog_search_uses_metadata_filters_and_semantic_recall() -> None:
-    result = plan_question("营销域 DWD 层搜索支付金额相关表和字段说明")
+    result = plan_question("营销域 DWD 层搜索支付明细相关表和表说明")
 
     assert result.intent == IntentType.METADATA_SEARCH
     assert result.entities.data_layer is not None
@@ -27,14 +27,13 @@ def test_lineage_query_supports_configurable_upstream_downstream_direction() -> 
     assert lineage_step.params["depth"] == 3
 
 
-def test_column_level_impact_analysis_uses_field_granularity() -> None:
-    result = plan_question("dwd.orderInfo 表字段 pay_amount 修改，对下游报表和任务有什么影响")
+def test_table_level_impact_analysis_uses_table_granularity() -> None:
+    result = plan_question("dwd.orderInfo 表修改，对下游报表和任务有什么影响")
 
     assert result.intent == IntentType.IMPACT_ANALYSIS
-    assert result.entities.field_name == "pay_amount"
     lineage_step = next(step for step in result.task_steps if step.tool_name == "neo4j_lineage")
-    assert lineage_step.params["field_name"] == "pay_amount"
-    assert lineage_step.params["lineage_granularity"] == "field"
+    assert "field_name" not in lineage_step.params
+    assert lineage_step.params["lineage_granularity"] == "table"
 
 
 def test_one_part_table_name_is_candidate_requiring_metadata_resolution() -> None:

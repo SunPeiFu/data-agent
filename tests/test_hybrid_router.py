@@ -44,13 +44,12 @@ def test_policy_resolver_uses_rule_when_llm_is_missing() -> None:
     assert result.notes
 
 
-def test_policy_resolver_marks_table_and_field_as_metadata_validation_candidates() -> None:
+def test_policy_resolver_marks_table_as_metadata_validation_candidate() -> None:
     rule = RulePreAnalysis(
         intent=IntentType.IMPACT_ANALYSIS,
         confidence=0.92,
         entities=ExtractedEntities(
             table=TableIdentifier.parse("dwd.orderInfo"),
-            field_name="pay_amount",
             operation=OperationType.MODIFY_FIELD,
             lineage_direction=LineageDirection.DOWNSTREAM,
         ),
@@ -59,10 +58,8 @@ def test_policy_resolver_marks_table_and_field_as_metadata_validation_candidates
     result = PolicyResolver().resolve(rule=rule, llm=None)
 
     assert result.entity_resolution.fields["table"].resolution == ConflictResolution.NEEDS_METADATA_VALIDATION
-    assert result.entity_resolution.fields["field_name"].resolution == ConflictResolution.NEEDS_METADATA_VALIDATION
     assert result.entities.table is not None
     assert result.entities.table.raw == "dwd.orderInfo"
-    assert result.entities.field_name == "pay_amount"
 
 
 def test_policy_resolver_requests_clarification_for_close_table_candidates() -> None:
