@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, TypedDict
 from uuid import uuid4
@@ -8,11 +9,15 @@ from langgraph.graph import END, StateGraph
 
 from data_agent.hybrid_router import HybridRouteResult, HybridQuestionRouter
 from data_agent.metadata_repository import MetadataCandidate, MetadataRepositoryError, MySQLMetadataRepository
+from data_agent.milvus_repository import MilvusMetadataRepository, MilvusRepositoryError
 from data_agent.models import (
     DataLayer,
     DomainType,
     ExtractedEntities,
     IntentType,
+    MetadataCandidateEvidence,
+    MetadataCandidateSource,
+    MetadataValidationStatus,
     NormalizationTrace,
     NormalizedTerm,
     NormalizedTermType,
@@ -46,7 +51,10 @@ class PlannerState(TypedDict, total=False):
     planner_decision: str
     metadata_candidates: dict[str, list[str]]
     metadata_candidate_profiles: dict[str, dict[str, str | None]]
+    metadata_candidate_evidence: dict[str, MetadataCandidateEvidence]
     table_term_candidates: dict[str, list[str]]
+    semantic_table_query: str | None
+    requested_table: TableIdentifier | None
     authorized: bool
     trace_id: str
     intent: IntentType
@@ -195,6 +203,7 @@ def _normalize_entities(state: PlannerState) -> PlannerState:
         "normalized_terms": terms,
         "normalization_traces": traces,
         "table_term_candidates": table_term_candidates,
+        "semantic_table_query": _build_semantic_table_query(question, normalized, table_term_candidates),
     }
 
 
@@ -254,7 +263,7 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
     核心职责：
     - 元数据候选解析完成后，检查表候选是否存在、是否唯一、是否可继续规划。
     - 这一步比 pre_validate 更接近生产，因为它基于元数据服务返回的候选质量做判断。
-    - 当前 mock 会用数仓分层先做一次候选过滤，仍无法唯一时才进入澄清分支。
+    - 校验候选来源、事实验证状态、规范表名、语义置信度和候选画像完整性。
 
     面试精华：
     前置校验回答“用户有没有给线索”，后置校验回答“这些线索能不能定位到唯一且一致的真实表”。
@@ -267,6 +276,8 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
     candidates = state.get("metadata_candidates", {})
     table_candidates = candidates.get("table", [])
     candidate_profiles = state.get("metadata_candidate_profiles", {})
+    candidate_evidence = state.get("metadata_candidate_evidence", {})
+    requested_table = state.get("requested_table")
     issues: list[SlotIssue] = []
     notes = [f"槽位后校验: intent={intent.value} 使用配置化 post_required_any={rule.post_required_any}。"]
 
@@ -280,7 +291,7 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
             )
         )
 
-    # 对血缘/影响分析来说，表候选是硬前提：没有候选不能查 Neo4j，多候选不能静默替用户选择。
+    # 对血缘/影响分析来说，候选表必须唯一且具备可审计的事实验证证据。
     if intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS}:
         if not table_candidates:
             issues.append(
@@ -298,9 +309,19 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
                     message=f"表名存在多个候选 {table_candidates}，需要用户选择唯一表。",
                 )
             )
+        else:
+            table_name = table_candidates[0]
+            evidence = candidate_evidence.get(table_name)
+            profile = candidate_profiles.get(table_name)
+            issues.extend(_validate_candidate_trust(table_name, evidence))
+            issues.extend(_validate_semantic_candidate_confidence(table_name, evidence))
+            issues.extend(_validate_executable_table_identity(entities, table_name))
+            issues.extend(_validate_requested_table_identity(requested_table, table_name, profile))
+            issues.extend(_validate_candidate_profile_completeness(entities, table_name, profile))
+            issues.extend(_validate_cross_slot_consistency(entities, table_candidates, candidate_profiles))
 
-    # 唯一候选表出来后，再检查用户输入的 domain/layer/biz_line 是否和表画像冲突。
-    issues.extend(_validate_cross_slot_consistency(entities, table_candidates, candidate_profiles))
+    # 通用 required_any 与 intent 专项校验可能发现同一个问题，输出前按槽位和问题类型去重。
+    issues = _deduplicate_slot_issues(issues)
 
     result = SlotValidationResult(
         stage=SlotValidationStage.POST_METADATA,
@@ -312,70 +333,120 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
 
 
 def _resolve_metadata_candidates(state: PlannerState) -> PlannerState:
-    """Resolve metadata candidates from MySQL.
+    """Resolve table candidates with certainty-aware MySQL/Milvus routing.
 
-    当前实现优先查询 MySQL meta_table / meta_table_ext，连接失败时使用 mock fallback 保障本地测试。
-    生产中可平滑替换为 TiDB / DataHub / OpenMetadata：
-    - 一段式表名解析成候选 fully qualified name。
-    - 两段式/三段式表名校验存在性。
-    - 表级业务术语映射到候选物理表。
+    生产路由：
+    - 两段式/三段式技术表名：MySQL 精确校验，不调用 Milvus。
+    - 一段式技术表名：先查 MySQL；无候选时再用 Milvus 补召回。
+    - 业务描述或表级术语：Milvus Dense + BM25 + 标量过滤召回。
+    - Milvus 返回的表名必须回 MySQL 校验，才允许进入血缘和影响分析。
 
     面试精华：
-    这个节点不是最终查血缘，也不是最终回答问题，而是把自然语言里的“表线索”
-    转成后续工具能理解的候选资产列表。它是防止 LLM 幻觉表名、误查血缘的关键缓冲层。
+    MySQL/TiDB 是元数据事实源，Milvus 是候选召回器。路由依据是实体确定性，
+    而不是所有问题固定先查一个库再查另一个库。
     """
     entities = state["entities"]
+    requested_table = entities.table.model_copy(deep=True) if entities.table else None
     candidates: dict[str, list[str]] = {}
     candidate_profiles: dict[str, dict[str, str | None]] = {}
+    candidate_evidence: dict[str, MetadataCandidateEvidence] = {}
     notes: list[str] = []
-    repository = MySQLMetadataRepository()
+    mysql_repository = MySQLMetadataRepository()
+    milvus_repository = MilvusMetadataRepository()
 
     table_term_candidates = state.get("table_term_candidates", {})
     table_terms = _table_term_lookup_values(state)
-    # 物理表名路径：用户已经说了 userInfo、dwd.orderInfo、catalog.dwd.orderInfo 等技术表名。
+    table_candidates: list[str] = []
+
+    # 技术表名路径：确定性越高，越优先使用结构化事实查询。
     if entities.table:
         try:
-            resolved_tables = repository.find_by_table_identifier(entities.table, entities)
+            resolved_tables = mysql_repository.find_by_table_identifier(entities.table, entities)
             table_candidates = _candidate_names(resolved_tables)
             candidate_profiles.update(_candidate_profiles(resolved_tables))
-            notes.append("元数据候选解析: 已通过 MySQL meta_table 查询物理表候选。")
+            _record_candidate_evidence(
+                candidate_evidence,
+                resolved_tables,
+                source=MetadataCandidateSource.MYSQL_IDENTIFIER,
+                status=MetadataValidationStatus.VALIDATED,
+            )
+            route = "exact_identifier" if entities.table.parts_count >= 2 else "partial_identifier"
+            notes.append(f"元数据候选解析: route={route}，已通过 MySQL meta_table 查询物理表候选。")
         except MetadataRepositoryError as exc:
             table_candidates = _mock_table_candidates(entities.table)
             candidate_profiles.update(_mock_candidate_profiles(table_candidates))
+            _record_fallback_evidence(candidate_evidence, table_candidates)
             notes.append(f"元数据候选解析: MySQL 查询失败，使用 mock 候选兜底。原因: {exc}")
-        table_candidates = _filter_table_candidates_by_context(table_candidates, entities)
-        candidates["table"] = table_candidates
         if entities.table.parts_count == 1:
             notes.append(f"元数据候选解析: 一段式表名 {entities.table.raw} 已生成候选 {table_candidates}。")
         else:
-            notes.append(f"元数据候选解析: 表名 {entities.table.raw} 已作为待校验候选。")
+            notes.append(f"元数据候选解析: 表名 {entities.table.raw} 已完成事实源校验，跳过 Milvus。")
 
-    # 表级业务术语路径：用户说的是“订单信息表”“支付明细表”这类业务叫法，需要映射到候选物理表。
+    # 结构化业务术语仍先查字典映射；它与后面的 Milvus 语义召回可以合并候选。
     if table_term_candidates:
         try:
-            resolved_terms = repository.find_by_table_terms(table_terms, entities)
+            resolved_terms = mysql_repository.find_by_table_terms(table_terms, entities)
             term_candidates = _candidate_names(resolved_terms)
             candidate_profiles.update(_candidate_profiles(resolved_terms))
+            _record_candidate_evidence(
+                candidate_evidence,
+                resolved_terms,
+                source=MetadataCandidateSource.MYSQL_TABLE_TERM,
+                status=MetadataValidationStatus.VALIDATED,
+            )
             notes.append("元数据候选解析: 已通过 MySQL meta_table_ext 查询表级业务术语候选。")
         except MetadataRepositoryError as exc:
             term_candidates = [table for tables in table_term_candidates.values() for table in tables]
             candidate_profiles.update(_mock_candidate_profiles(term_candidates))
+            _record_fallback_evidence(candidate_evidence, term_candidates)
             notes.append(f"元数据候选解析: MySQL 术语查询失败，使用配置候选兜底。原因: {exc}")
-        existing = candidates.get("table", [])
-        # 如果用户同时给了分层，例如 DWD 层，就先用上下文缩小候选范围。
-        merged_candidates = _filter_table_candidates_by_context(
-            _merge_preserve_order([*existing, *term_candidates]),
-            entities,
-        )
-        candidates["table"] = merged_candidates
+        table_candidates = _merge_preserve_order([*table_candidates, *term_candidates])
         notes.append(f"元数据候选解析: table_terms 命中候选表 {table_term_candidates}。")
-        # 唯一候选可以回填到 entities.table，后续 task_builder 才能生成确定的工具参数。
-        if entities.table is None and len(merged_candidates) == 1:
-            entities = entities.model_copy(update={"table": TableIdentifier.parse(merged_candidates[0])})
-            notes.append(f"元数据候选解析: 唯一候选表 {merged_candidates[0]} 已回填到实体。")
-        # 多候选不能自动选择，否则可能查错血缘；交给 post_validate_slots 触发澄清。
-        elif entities.table is None and len(merged_candidates) > 1:
-            notes.append("元数据候选解析: 多个候选表未自动选择，等待澄清或真实元数据排序。")
+
+    # 弱语义路径：没有明确技术表名，或一段式表名在 MySQL 中未命中时，调用 Milvus 混合召回。
+    semantic_query = state.get("semantic_table_query")
+    validated_before_semantic = _validated_candidate_names(candidate_evidence)
+    if _should_use_semantic_recall(entities, validated_before_semantic, semantic_query):
+        try:
+            response = milvus_repository.hybrid_search(semantic_query or state["question"], entities, top_k=20)
+            recalled_names = [candidate.full_table_name for candidate in response.candidates]
+            notes.append(
+                f"元数据候选解析: route=semantic_description，Milvus mode={response.retrieval_mode} "
+                f"召回 {len(recalled_names)} 个候选。"
+            )
+            try:
+                validated = mysql_repository.find_by_full_table_names(recalled_names, entities)
+            except MetadataRepositoryError as exc:
+                validated = []
+                notes.append(f"元数据候选解析: Milvus 候选无法回 MySQL 校验，候选不进入执行链路。原因: {exc}")
+            table_candidates = _merge_preserve_order([*table_candidates, *_candidate_names(validated)])
+            candidate_profiles.update(_candidate_profiles(validated))
+            _record_milvus_validated_evidence(candidate_evidence, response, validated)
+            notes.append(f"元数据候选解析: {len(validated)} 个 Milvus 候选通过 MySQL 事实校验。")
+        except MilvusRepositoryError as exc:
+            notes.append(f"元数据候选解析: Milvus 召回不可用，保留结构化查询结果。原因: {exc}")
+
+    # 一旦存在事实验证候选，就丢弃仅用于本地演示的 mock/config fallback，避免污染真实消歧。
+    validated_candidates = [
+        table_name
+        for table_name in table_candidates
+        if (evidence := candidate_evidence.get(table_name))
+        and evidence.validation_status == MetadataValidationStatus.VALIDATED
+    ]
+    if validated_candidates:
+        table_candidates = validated_candidates
+
+    # 统一在所有召回路径结束后做上下文过滤，避免每条路径形成不同的消歧规则。
+    table_candidates = _filter_table_candidates_by_context(table_candidates, entities)
+    if table_candidates or entities.table or table_term_candidates or semantic_query:
+        candidates["table"] = table_candidates
+
+    # 唯一候选始终覆盖原始一段式实体，保证 Neo4j 接收到 db.table，而不是 userInfo。
+    if len(table_candidates) == 1:
+        entities = entities.model_copy(update={"table": TableIdentifier.parse(table_candidates[0])})
+        notes.append(f"元数据候选解析: 唯一候选表 {table_candidates[0]} 已回填到实体。")
+    elif entities.table is None and len(table_candidates) > 1:
+        notes.append("元数据候选解析: 多个候选表未自动选择，等待 post_validate_slots 消歧。")
 
     if not notes:
         notes.append("元数据候选解析: 当前问题无需表候选解析。")
@@ -385,11 +456,28 @@ def _resolve_metadata_candidates(state: PlannerState) -> PlannerState:
         for table_name, profile in candidate_profiles.items()
         if table_name in candidates.get("table", [])
     }
+    candidate_evidence = {
+        table_name: evidence
+        for table_name, evidence in candidate_evidence.items()
+        if table_name in candidates.get("table", [])
+    }
+    for table_name, evidence in candidate_evidence.items():
+        score_text = f", score={evidence.score:.4f}" if evidence.score is not None else ""
+        notes.append(
+            f"元数据候选证据: table={table_name}, source={evidence.source.value}, "
+            f"status={evidence.validation_status.value}{score_text}。"
+        )
+    #entities 是解析后可继续使用的实体
+    # metadata_candidates 是候选表列表 只有一个key -> table即fullTableName, value是元数据的候选表名
+    # metadata_candidate_profiles 是候选表画像 key -> fullTableName, value -> 表的完整结构
+    # metadata_notes 是元数据解析过程说明。
     return {
         "entities": entities,
         "metadata_candidates": candidates,
         "metadata_candidate_profiles": candidate_profiles,
+        "metadata_candidate_evidence": candidate_evidence,
         "metadata_notes": notes,
+        "requested_table": requested_table,
     }
 
 
@@ -785,7 +873,112 @@ def _candidate_profiles(candidates: list[MetadataCandidate]) -> dict[str, dict[s
     候选名只解决“有哪些表”，profile 解决“这些表属于哪个域/分层/业务线”。
     post_validate_slots 会用 profile 做跨槽位一致性校验。
     """
+    # python中的字典推导 返回一个dict  key是遍历的candidate中的full_table_name, value是candidate.profile()
     return {candidate.full_table_name: candidate.profile() for candidate in candidates}
+
+
+def _record_candidate_evidence(
+    evidence_by_table: dict[str, MetadataCandidateEvidence],
+    candidates: list[MetadataCandidate],
+    source: MetadataCandidateSource,
+    status: MetadataValidationStatus,
+) -> None:
+    """Record authoritative repository evidence without replacing a stronger existing source."""
+    for candidate in candidates:
+        _upsert_candidate_evidence(
+            evidence_by_table,
+            MetadataCandidateEvidence(
+                full_table_name=candidate.full_table_name,
+                source=source,
+                validation_status=status,
+            ),
+        )
+
+
+def _record_fallback_evidence(
+    evidence_by_table: dict[str, MetadataCandidateEvidence],
+    table_names: list[str],
+) -> None:
+    """Mark mock/config candidates as non-authoritative so post validation can fail closed."""
+    for table_name in table_names:
+        _upsert_candidate_evidence(
+            evidence_by_table,
+            MetadataCandidateEvidence(
+                full_table_name=table_name,
+                source=MetadataCandidateSource.MOCK_FALLBACK,
+                validation_status=MetadataValidationStatus.FALLBACK,
+            ),
+        )
+
+
+def _record_milvus_validated_evidence(
+    evidence_by_table: dict[str, MetadataCandidateEvidence],
+    response: Any,
+    validated_candidates: list[MetadataCandidate],
+) -> None:
+    """Attach Milvus rank/score only to candidates that were validated again by MySQL."""
+    recalled = response.candidates
+    recalled_by_name = {candidate.full_table_name: candidate for candidate in recalled}
+    rank_by_name = {candidate.full_table_name: rank for rank, candidate in enumerate(recalled, start=1)}
+    gap_by_name: dict[str, float | None] = {}
+    for index, candidate in enumerate(recalled):
+        next_score = recalled[index + 1].score if index + 1 < len(recalled) else None
+        gap_by_name[candidate.full_table_name] = (
+            abs(candidate.score - next_score) if next_score is not None else None
+        )
+
+    for candidate in validated_candidates:
+        recalled_candidate = recalled_by_name.get(candidate.full_table_name)
+        if recalled_candidate is None:
+            continue
+        _upsert_candidate_evidence(
+            evidence_by_table,
+            MetadataCandidateEvidence(
+                full_table_name=candidate.full_table_name,
+                source=MetadataCandidateSource.MILVUS_MYSQL_VALIDATED,
+                validation_status=MetadataValidationStatus.VALIDATED,
+                score=recalled_candidate.score,
+                rank=rank_by_name[candidate.full_table_name],
+                score_gap_to_next=gap_by_name[candidate.full_table_name],
+                retrieval_mode=response.retrieval_mode,
+            ),
+        )
+
+
+def _upsert_candidate_evidence(
+    evidence_by_table: dict[str, MetadataCandidateEvidence],
+    incoming: MetadataCandidateEvidence,
+) -> None:
+    """Keep the most trustworthy evidence when multiple recall paths hit the same table."""
+    existing = evidence_by_table.get(incoming.full_table_name)
+    if existing is None or _evidence_priority(incoming) > _evidence_priority(existing):
+        evidence_by_table[incoming.full_table_name] = incoming
+
+
+def _evidence_priority(evidence: MetadataCandidateEvidence) -> tuple[int, int]:
+    status_priority = {
+        MetadataValidationStatus.FALLBACK: 0,
+        MetadataValidationStatus.UNVERIFIED: 1,
+        MetadataValidationStatus.VALIDATED: 2,
+    }
+    source_priority = {
+        MetadataCandidateSource.MOCK_FALLBACK: 0,
+        MetadataCandidateSource.MILVUS_MYSQL_VALIDATED: 1,
+        MetadataCandidateSource.MYSQL_TABLE_TERM: 2,
+        MetadataCandidateSource.MYSQL_IDENTIFIER: 3,
+    }
+    return status_priority[evidence.validation_status], source_priority[evidence.source]
+
+
+def _validated_candidate_names(
+    evidence_by_table: dict[str, MetadataCandidateEvidence],
+) -> list[str]:
+    """Return only candidates proven to exist in the authoritative metadata store."""
+    return [
+        table_name
+        for table_name, evidence in evidence_by_table.items()
+        if evidence.validation_status == MetadataValidationStatus.VALIDATED
+    ]
 
 
 def _mock_candidate_profiles(candidates: list[str]) -> dict[str, dict[str, str | None]]:
@@ -815,6 +1008,250 @@ def _table_term_lookup_values(state: PlannerState) -> list[str]:
     return _merge_preserve_order(values)
 
 
+def _build_semantic_table_query(
+    question: str,
+    entities: ExtractedEntities,
+    table_term_candidates: dict[str, list[str]],
+) -> str | None:
+    """Build a Milvus query only when the question contains a usable table signal.
+
+    核心职责：
+    - 明确的两段式/三段式技术表名由 MySQL 事实查询处理，不额外构造语义检索请求。
+    - 一段式表名、表级业务术语或“广告投放转化率相关表”可以形成语义检索请求。
+    - 只有“查询下游依赖”但没有表资产或业务描述时返回 None，防止 Milvus 猜表。
+
+    这里仅判断“有没有可检索的业务语义”，不决定是否真正调用 Milvus；最终路由由
+    `_should_use_semantic_recall` 结合 MySQL 候选结果决定。
+    """
+    if entities.table and entities.table.parts_count >= 2:
+        return None
+
+    has_table_context = "表" in question or bool(table_term_candidates)
+    has_business_signal = bool(
+        table_term_candidates
+        or entities.topic_keywords
+        or entities.domain
+        or entities.data_layer
+        or re.search(
+            r"[\u4e00-\u9fff]{2,}(?:指标|转化率|明细|汇总|画像|投放|订单|支付|用户)",
+            question,
+        )
+    )
+    if not has_table_context or not has_business_signal:
+        return None
+    return question.strip() or None
+
+
+def _should_use_semantic_recall(
+    entities: ExtractedEntities,
+    table_candidates: list[str],
+    semantic_query: str | None,
+) -> bool:
+    """Decide whether metadata resolution should invoke Milvus semantic recall.
+
+    核心职责：按照表实体确定性和 MySQL 查询结果进行成本可控的检索路由。
+
+    决策规则：
+    1. 没有有效 semantic_query：不调用 Milvus。
+    2. 没有技术表名、只有业务描述或业务术语：调用 Milvus 主动召回候选。
+    3. 两段式/三段式技术表名：无论 MySQL 是否命中，都不调用 Milvus；事实库的
+       “不存在”不能被向量库的近似结果覆盖。
+    4. 一段式技术表名：MySQL 已经找到候选时不调用；MySQL 零结果时才用 Milvus 补召回。
+
+    `table_candidates` 必须是经过 MySQL/meta_table 或结构化术语查询得到的当前候选，
+    不能传入尚未经过事实校验的 Milvus 原始结果。
+    """
+    if not semantic_query:
+        return False
+
+    table = entities.table
+    if table is None:
+        return True
+    if table.parts_count >= 2:
+        return False
+
+    # 兜底 啥都没查出来 & 是语义查询 走mivlus
+    return not table_candidates
+
+
+def _validate_candidate_trust(
+    table_name: str,
+    evidence: MetadataCandidateEvidence | None,
+) -> list[SlotIssue]:
+    """Require authoritative metadata evidence before lineage or impact execution."""
+    if evidence is None:
+        return [
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.INVALID,
+                message=f"候选表 {table_name} 缺少来源和事实校验证据，不能进入执行链路。",
+            )
+        ]
+    if evidence.validation_status != MetadataValidationStatus.VALIDATED:
+        return [
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.INVALID,
+                message=(
+                    f"候选表 {table_name} 仅来自 {evidence.source.value}，"
+                    f"状态为 {evidence.validation_status.value}，尚未通过 MySQL 元数据事实校验。"
+                ),
+            )
+        ]
+    return []
+
+
+def _validate_semantic_candidate_confidence(
+    table_name: str,
+    evidence: MetadataCandidateEvidence | None,
+) -> list[SlotIssue]:
+    """Apply configurable score and score-gap policies to Milvus-origin candidates.
+
+    不同检索模式的原始分数尺度不同，因此默认阈值为 0，生产上线前应通过离线评测集
+    标定 DATA_AGENT_MILVUS_MIN_SCORE 和 DATA_AGENT_MILVUS_MIN_SCORE_GAP。
+    """
+    if evidence is None or evidence.source != MetadataCandidateSource.MILVUS_MYSQL_VALIDATED:
+        return []
+    if evidence.score is None:
+        return [
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.LOW_CONFIDENCE,
+                message=f"语义候选表 {table_name} 缺少召回分数，不能自动选择。",
+            )
+        ]
+
+    min_score = float(os.getenv("DATA_AGENT_MILVUS_MIN_SCORE", "0"))
+    min_gap = float(os.getenv("DATA_AGENT_MILVUS_MIN_SCORE_GAP", "0"))
+    issues: list[SlotIssue] = []
+    if evidence.score < min_score:
+        issues.append(
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.LOW_CONFIDENCE,
+                message=(
+                    f"语义候选表 {table_name} 的 score={evidence.score:.4f} "
+                    f"低于自动选择阈值 {min_score:.4f}。"
+                ),
+            )
+        )
+    if evidence.score_gap_to_next is not None and evidence.score_gap_to_next < min_gap:
+        issues.append(
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.LOW_CONFIDENCE,
+                message=(
+                    f"语义候选表 {table_name} 与下一候选分差 {evidence.score_gap_to_next:.4f} "
+                    f"低于自动选择阈值 {min_gap:.4f}。"
+                ),
+            )
+        )
+    return issues
+
+
+def _validate_executable_table_identity(
+    entities: ExtractedEntities,
+    candidate_name: str,
+) -> list[SlotIssue]:
+    """Ensure downstream tools receive the unique canonical candidate, not a one-part alias."""
+    table = entities.table
+    if table is None or table.parts_count < 2 or table.raw.casefold() != candidate_name.casefold():
+        actual = table.raw if table else None
+        return [
+            _slot_issue(
+                slot_name="table",
+                issue_type=SlotIssueType.INVALID,
+                message=(
+                    f"唯一候选为 {candidate_name}，但可执行表实体为 {actual}；"
+                    "必须先回填规范化 db.table 后才能调用血缘工具。"
+                ),
+            )
+        ]
+    return []
+
+
+def _validate_requested_table_identity(
+    requested_table: TableIdentifier | None,
+    candidate_name: str,
+    profile: dict[str, str | None] | None,
+) -> list[SlotIssue]:
+    """Prevent an exact two/three-part identifier from resolving to another physical asset."""
+    if requested_table is None or requested_table.parts_count < 2:
+        return []
+
+    candidate = TableIdentifier.parse(candidate_name)
+    actual_catalog = (profile or {}).get("catalog_name") or candidate.catalog
+    actual_schema = (profile or {}).get("db_name") or candidate.schema_name
+    actual_table = (profile or {}).get("table_name") or candidate.table_name
+    mismatches: list[str] = []
+    if requested_table.catalog and _casefold(requested_table.catalog) != _casefold(actual_catalog):
+        mismatches.append("catalog")
+    if requested_table.schema_name and _casefold(requested_table.schema_name) != _casefold(actual_schema):
+        mismatches.append("schema")
+    if _casefold(requested_table.table_name) != _casefold(actual_table):
+        mismatches.append("table_name")
+    if not mismatches:
+        return []
+    return [
+        _slot_issue(
+            slot_name="table",
+            issue_type=SlotIssueType.CONFLICT,
+            message=(
+                f"用户请求表 {requested_table.raw} 与事实候选 {candidate_name} "
+                f"在 {mismatches} 上不一致。"
+            ),
+        )
+    ]
+
+
+def _validate_candidate_profile_completeness(
+    entities: ExtractedEntities,
+    table_name: str,
+    profile: dict[str, str | None] | None,
+) -> list[SlotIssue]:
+    """Require identity fields and any user-specified governance dimensions in the profile."""
+    if profile is None:
+        return [
+            _slot_issue(
+                slot_name="table_profile",
+                issue_type=SlotIssueType.INVALID,
+                message=f"候选表 {table_name} 缺少权威元数据画像。",
+            )
+        ]
+
+    required_fields = ["db_name", "table_name"]
+    if entities.biz_line:
+        required_fields.append("biz_line")
+    if entities.domain:
+        required_fields.append("domain")
+    if entities.data_layer:
+        required_fields.append("data_layer")
+    missing_fields = [field_name for field_name in required_fields if not profile.get(field_name)]
+    if not missing_fields:
+        return []
+    return [
+        _slot_issue(
+            slot_name="table_profile",
+            issue_type=SlotIssueType.INVALID,
+            message=f"候选表 {table_name} 的权威画像缺少字段 {missing_fields}。",
+        )
+    ]
+
+
+def _casefold(value: str | None) -> str | None:
+    return value.casefold() if value is not None else None
+
+
+def _deduplicate_slot_issues(issues: list[SlotIssue]) -> list[SlotIssue]:
+    """Collapse repeated generic/specialized findings while keeping the later, clearer message."""
+    deduplicated: dict[tuple[str, SlotIssueType, str], SlotIssue] = {}
+    for issue in issues:
+        # MISSING 经常同时来自 required_any 和 intent 专项校验，只保留后者更明确的提示。
+        message_key = "" if issue.issue_type == SlotIssueType.MISSING else issue.message
+        deduplicated[(issue.slot_name, issue.issue_type, message_key)] = issue
+    return list(deduplicated.values())
+
+
 def _validate_cross_slot_consistency(
     entities: ExtractedEntities,
     table_candidates: list[str],
@@ -838,7 +1275,7 @@ def _validate_cross_slot_consistency(
         return []
 
     table_name = table_candidates[0]
-    profile = candidate_profiles.get(table_name) or MOCK_TABLE_PROFILES.get(table_name)
+    profile = candidate_profiles.get(table_name)
     if not profile:
         return []
 

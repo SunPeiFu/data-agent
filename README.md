@@ -1,6 +1,6 @@
 # 智能数据探查
 
-面向真实面试和代码学习的 Agent 项目。当前 v1 只实现意图识别、实体抽取、任务拆解和工具路由计划生成，不连接真实 TiDB、Milvus、Neo4j。
+面向真实面试和代码学习的 Agent 项目。当前已实现意图识别、实体标准化、槽位校验、MySQL 元数据候选解析，以及 Milvus 表资产混合召回接入。
 
 ## 技术选型
 
@@ -34,6 +34,26 @@ python -m data_agent.cli plan "营销域下的 dwd层的userInfo表修改字段�
 ```
 
 如果没有配置 `DATA_AGENT_LLM_MODEL`，系统会自动使用离线规则兜底，方便测试和演示。
+
+## 启动 Milvus
+
+项目使用独立容器和数据卷，复用本机已有的 Milvus 2.5.14 镜像：
+
+```bash
+docker compose -f docker-compose.milvus.yml up -d
+conda run -n python-agent python -m data_agent.milvus_schema
+```
+
+本地 Embedding 使用 LM Studio 的 OpenAI-compatible `/v1/embeddings`：
+
+```bash
+export DATA_AGENT_EMBEDDING_BASE_URL="http://127.0.0.1:1234/v1"
+export DATA_AGENT_EMBEDDING_API_KEY="lm-studio"
+export DATA_AGENT_EMBEDDING_MODEL="你的 embedding 模型 ID"
+export DATA_AGENT_EMBEDDING_DIM="1024"
+```
+
+Milvus SDK 地址为 `http://127.0.0.1:19531`，WebUI 为 `http://127.0.0.1:9092/webui/`。
 
 ## 测试
 

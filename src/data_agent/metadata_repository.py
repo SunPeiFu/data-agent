@@ -172,6 +172,28 @@ class MySQLMetadataRepository:
         """
         return self._fetch_candidates(sql, (*unique_terms, *unique_terms), entities)
 
+    def find_by_full_table_names(
+        self,
+        table_names: list[str],
+        entities: ExtractedEntities,
+    ) -> list[MetadataCandidate]:
+        """Validate externally recalled table names against the metadata source of truth.
+
+        原子职责：
+        Milvus 只负责召回候选，不负责证明资产真实存在。该方法把向量召回结果重新交给
+        meta_table 校验，并补齐主题域、分层、负责人等权威表画像。
+        """
+        unique_names = _unique([name for name in table_names if name])
+        if not unique_names:
+            return []
+        placeholders = ",".join(["%s"] * len(unique_names))
+        sql = f"""
+            SELECT * FROM meta_table
+            WHERE lifecycle_status = 'online'
+              AND full_table_name IN ({placeholders})
+        """
+        return self._fetch_candidates(sql, tuple(unique_names), entities)
+
     def _fetch_candidates(
         self,
         sql: str,

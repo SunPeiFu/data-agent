@@ -29,7 +29,7 @@ v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它
 - `extract_entities`：直接消费 Hybrid Router 合并后的实体结果；无模型或模型输出不合法时使用规则预分析兜底。
 - `normalize_entities`：标准化 LLM/规则抽取出的实体，包括表名 schema/catalog 大小写、表级业务术语、topic_keywords 去重去噪、主题域/数仓分层词剔除，并记录归一化 notes。
 - `validate_slots`：元数据解析前槽位校验，根据 `config/slot_rules.yml` 判断用户是否提供最低可执行线索。
-- `resolve_metadata_candidates`：优先查询 MySQL `meta_table` / `meta_table_ext` 解析表名和表级业务术语候选；连接失败时使用 mock fallback，后续可替换为 TiDB / DataHub / OpenMetadata 等元数据服务。
+- `resolve_metadata_candidates`：按实体确定性动态路由。两/三段式表名直接查 MySQL；一段式先查 MySQL、未命中再补 Milvus；业务描述走 Milvus Dense + BM25 + 标量过滤，召回结果必须回 MySQL 校验。
 - `authorize_context`：mock 权限和治理校验；后续接权限系统、业务域隔离和审计策略。
 - `post_validate_slots`：元数据解析后槽位校验，判断候选表是否存在、是否唯一、是否可继续规划。
 - `decide_clarification_or_continue`：根据结构化 `SlotValidationResult` 和权限状态输出 `continue`、`clarify` 或 `forbidden`，由 LangGraph conditional edge 控制后续分支。
@@ -51,7 +51,7 @@ v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它
 
 ## 当前实现边界
 
-当前 `resolve_metadata_candidates` 已接入 MySQL 元数据候选解析；TiDB、Milvus、Neo4j 仍是“计划中的工具”，不会真正执行查询。这个边界是刻意设计的，方便先把 Agent 的规划层和表级元数据解析讲清楚，再逐步补真实执行层。
+当前 `resolve_metadata_candidates` 已接入 MySQL 元数据候选解析和 Milvus 查询 Repository。Milvus Collection 数据同步、TiDB、Neo4j 和最终工具执行仍待后续补齐。详细路由与 Schema 见 `docs/metadata_candidate_resolution_design.md`。
 
 ## LLM 接入
 

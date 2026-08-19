@@ -27,7 +27,9 @@ def test_enterprise_planner_one_part_table_uses_layer_to_narrow_candidates() -> 
     assert "一段式表名 userInfo 已生成候选" in notes
     assert result.need_clarification is False
     assert result.entities.table is not None
-    assert result.entities.table.raw == "userInfo"
+    assert result.entities.table.raw == "dwd.userInfo"
+    lineage_step = next(step for step in result.task_steps if step.action == "lineage_search")
+    assert lineage_step.params["table"] == "dwd.userInfo"
     assert "槽位后校验: 通过。" in notes
 
 
@@ -74,7 +76,11 @@ def test_enterprise_planner_maps_topic_synonym_to_canonical_term() -> None:
 def test_enterprise_planner_uses_configured_slot_rules() -> None:
     config = load_slot_rule_config()
 
-    assert config.rule_for(IntentType.IMPACT_ANALYSIS).pre_required_any == ["table", "table_term"]
+    assert config.rule_for(IntentType.IMPACT_ANALYSIS).pre_required_any == [
+        "table",
+        "table_term",
+        "semantic_table_query",
+    ]
     assert config.rule_for(IntentType.IMPACT_ANALYSIS).post_required_any == ["table"]
 
 

@@ -1,6 +1,6 @@
 # 智能数据探查 TODO List
 
-这份 TODO 的目标是帮助你先整体串通项目骨架，再逐步把 Planner 层升级成真实生产 DataAgent。当前项目已经完成：Hybrid Router、实体标准化、结构化槽位校验、MySQL 元数据候选解析、mock 权限校验、条件澄清决策、任务计划生成、计划校验和 trace notes。
+这份 TODO 的目标是帮助你先整体串通项目骨架，再逐步把 Planner 层升级成真实生产 DataAgent。当前项目已经完成：Hybrid Router、实体标准化、结构化槽位校验、MySQL 元数据候选解析、Milvus 混合召回 Repository 与 Collection Schema、mock 权限校验、条件澄清决策、任务计划生成、计划校验和 trace notes。
 
 ## P0：先串通现有骨架
 
@@ -29,17 +29,19 @@
 - [ ] 接入 TiDB 元数据工具：
   - [ ] `filter_tables`
   - [x] `resolve_table` 候选解析已先用 MySQL `meta_table` / `meta_table_ext` 落地。
-  - [ ] 支持一段式、两段式、三段式表名解析。
-  - [ ] 支持表级业务术语到候选物理表的解析。
-- [ ] 接入 Milvus RAG 工具：
-  - [ ] `semantic_search`
-  - [ ] 支持表说明、表级业务术语召回。
-  - [ ] 增加 hybrid search：结构化过滤 + 向量召回。
+  - [x] 支持一段式、两段式、三段式表名解析。
+  - [x] 支持表级业务术语到候选物理表的解析。
+- [ ] 完成 Milvus 表资产数据同步与执行闭环（Collection Schema 和查询 Repository 已完成）：
+  - [x] 实现 `MilvusMetadataRepository.hybrid_search` 查询接口。
+  - [ ] 将表说明、表级业务术语及 embedding 增量同步到 Collection。
+  - [x] 增加 hybrid search：Dense + BM25 + 结构化过滤 + RRF。
+  - [ ] 增加离线召回评测集、阈值标定和线上检索指标。
 - [ ] 接入 Neo4j 血缘工具：
   - [ ] `lineage_search(direction=upstream/downstream/both)`
   - [ ] 支持 `depth`
   - [ ] 支持表级血缘。
 - [ ] 后续把 MySQL 版 `resolve_metadata_candidates` 替换为真实 TiDB / 数据目录查询。
+- [ ] 元数据模型补充 platform/environment/tenant 后，将三者加入候选身份一致性和权限域校验。
 - [ ] 把 mock 的 `authorize_context` 替换为真实权限、业务域隔离和审计策略。
 
 ## P2：补 LangGraph 执行闭环

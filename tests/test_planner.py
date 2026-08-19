@@ -44,7 +44,7 @@ def test_case_3_impact_plan_uses_both_direction_and_semantic_context() -> None:
     assert result.entities.data_layer == DataLayer.DWD
     assert result.entities.lineage_direction == LineageDirection.BOTH
     assert result.entities.table is not None
-    assert result.entities.table.raw == "userInfo"
+    assert result.entities.table.raw == "dwd.userInfo"
 
     actions = [(step.tool_name, step.action) for step in result.task_steps]
     assert ("tidb_metadata", "resolve_table") in actions
@@ -52,6 +52,7 @@ def test_case_3_impact_plan_uses_both_direction_and_semantic_context() -> None:
     assert ("milvus_rag", "semantic_search") in actions
     assert ("impact_analyzer", "merge_lineage_and_metadata") in actions
     lineage_step = next(step for step in result.task_steps if step.tool_name == "neo4j_lineage")
+    assert lineage_step.params["table"] == "dwd.userInfo"
     assert lineage_step.params["direction"] == "both"
 
 

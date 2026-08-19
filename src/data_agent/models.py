@@ -80,6 +80,35 @@ class SlotValidationStage(str, Enum):
     POST_METADATA = "post_metadata"
 
 
+class MetadataCandidateSource(str, Enum):
+    """Describe which retrieval path produced a table candidate."""
+
+    MYSQL_IDENTIFIER = "mysql_identifier"
+    MYSQL_TABLE_TERM = "mysql_table_term"
+    MILVUS_MYSQL_VALIDATED = "milvus_mysql_validated"
+    MOCK_FALLBACK = "mock_fallback"
+
+
+class MetadataValidationStatus(str, Enum):
+    """Separate authoritative candidates from degraded or unverified results."""
+
+    VALIDATED = "validated"
+    UNVERIFIED = "unverified"
+    FALLBACK = "fallback"
+
+
+class MetadataCandidateEvidence(BaseModel):
+    """Auditable evidence used by post slot validation to gate tool execution."""
+
+    full_table_name: str
+    source: MetadataCandidateSource
+    validation_status: MetadataValidationStatus
+    score: float | None = None
+    rank: int | None = None
+    score_gap_to_next: float | None = None
+    retrieval_mode: str | None = None
+
+
 class SlotIssue(BaseModel):
     slot_name: str
     issue_type: SlotIssueType

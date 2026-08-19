@@ -14,12 +14,14 @@ intents:
     pre_required_any:
       - table
       - table_term
+      - semantic_table_query
     post_required_any:
       - table
   impact_analysis:
     pre_required_any:
       - table
       - table_term
+      - semantic_table_query
     post_required_any:
       - table
   unknown:

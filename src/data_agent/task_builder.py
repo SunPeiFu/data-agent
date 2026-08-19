@@ -15,6 +15,7 @@ def build_task_plan(question: str, intent: IntentType, confidence: float, entiti
 
     if intent == IntentType.METADATA_SEARCH:
         steps = _metadata_steps(entities)
+        # ⭐️可以把gpt的方案拿过来 metadta_steps里改成gpt的方案 根据实体的确定性
     elif intent == IntentType.LINEAGE_SEARCH:
         steps = _lineage_steps(entities)
     elif intent == IntentType.IMPACT_ANALYSIS:
