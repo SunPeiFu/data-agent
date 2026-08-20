@@ -1,6 +1,6 @@
-from data_agent.hybrid_router import ConflictResolution, HybridQuestionRouter
-from data_agent.models import IntentType, LineageDirection
-from data_agent.planner import plan_question
+from data_agent.intelligence.hybrid_router import ConflictResolution, HybridQuestionRouter
+from data_agent.domain.models import IntentType, LineageDirection
+from data_agent.application.planning.service import plan_question
 
 
 def test_data_catalog_search_uses_metadata_filters_and_semantic_recall() -> None:

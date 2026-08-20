@@ -1,5 +1,5 @@
-from data_agent.extractor import extract_entities
-from data_agent.models import DataLayer, DomainType
+from data_agent.intelligence.extractor import extract_entities
+from data_agent.domain.models import DataLayer, DomainType
 
 
 def test_extractor_falls_back_without_llm_model(monkeypatch) -> None:

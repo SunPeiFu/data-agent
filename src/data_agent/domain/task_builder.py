@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from data_agent.models import (
+from data_agent.domain.models import (
     ExtractedEntities,
     IntentType,
     LineageDirection,

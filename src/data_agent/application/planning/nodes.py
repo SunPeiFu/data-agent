@@ -5,20 +5,19 @@ import re
 import logging
 from datetime import datetime, timezone
 from hashlib import sha256
-from functools import lru_cache
 from time import perf_counter
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, Protocol
 from uuid import uuid4
 
-from langgraph.graph import END, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import interrupt
 
-from data_agent.authorization import YamlAuthorizationProvider
-from data_agent.checkpointing import get_planner_checkpointer
-from data_agent.hybrid_router import HybridRouteResult, HybridQuestionRouter
-from data_agent.metadata_repository import MetadataCandidate, MetadataRepositoryError, MySQLMetadataRepository
-from data_agent.milvus_repository import MilvusMetadataRepository, MilvusRepositoryError
-from data_agent.models import (
+from data_agent.application.planning.errors import ClarificationProtocolError
+from data_agent.infrastructure.security.authorization import YamlAuthorizationProvider
+from data_agent.application.planning.state import PlannerState
+from data_agent.intelligence.hybrid_router import HybridQuestionRouter
+from data_agent.infrastructure.repositories.mysql_metadata import MetadataCandidate, MetadataRepositoryError, MySQLMetadataRepository
+from data_agent.infrastructure.repositories.milvus_metadata import MilvusMetadataRepository, MilvusRepositoryError
+from data_agent.domain.models import (
     AccessContext,
     AgentRunStatus,
     AuthorizationDecision,
@@ -50,63 +49,27 @@ from data_agent.models import (
     TraceContext,
     TraceEvent,
 )
-from data_agent.normalization import load_normalization_config
-from data_agent.slot_rules import load_slot_rule_config
-from data_agent.task_builder import build_task_plan
-from data_agent.trace_recorder import TraceRecorder, get_trace_recorder
+from data_agent.domain.normalization import load_normalization_config
+from data_agent.domain.slot_rules import load_slot_rule_config
+from data_agent.domain.task_builder import build_task_plan
+from data_agent.infrastructure.observability.trace_recorder import TraceRecorder, get_trace_recorder
 
 
 PLANNER_VERSION = "v1-enterprise-planner"
 _TRACE_LOGGER = logging.getLogger("data_agent.trace.instrumentation")
 
 
-class PlannerState(TypedDict, total=False):
-    question: str
-    thread_id: str
-    access_context: AccessContext
-    route_result: HybridRouteResult
-    routing_notes: list[str]
-    normalization_notes: list[str]
-    normalized_terms: list[NormalizedTerm]
-    normalization_traces: list[NormalizationTrace]
-    metadata_notes: list[str]
-    authorization_notes: list[str]
-    clarification_notes: list[str] # 澄清
-    plan_validation_notes: list[str]
-    trace_notes: list[str]
-    trace_context: TraceContext
-    node_traces: list[NodeTrace]
-    trace_events: list[TraceEvent]
-    slot_errors: list[str]
-    pre_slot_validation: SlotValidationResult
-    post_slot_validation: SlotValidationResult
-    planner_decision: str
-    clarification_round: int
-    max_clarification_rounds: int
-    state_version: int
-    clarification_history: list[ClarificationAnswerRecord]
-    confirmed_slots: list[str]
-    processed_idempotency_keys: list[str]
-    metadata_candidates: dict[str, list[str]]
-    metadata_candidate_profiles: dict[str, dict[str, str | None]]
-    metadata_candidate_evidence: dict[str, MetadataCandidateEvidence]
-    table_term_candidates: dict[str, list[str]]
-    semantic_table_query: str | None
-    requested_table: TableIdentifier | None
-    authorized: bool
-    authorization_decisions: list[AuthorizationDecision]
-    trace_id: str
-    intent: IntentType
-    confidence: float
-    entities: ExtractedEntities
-    result: PlanningResult
+class PlannerNode(Protocol):
+    """Callable contract that preserves LangGraph's required named ``state`` parameter."""
+
+    def __call__(self, state: PlannerState) -> PlannerState: ...
 
 
 def traced_node(
     node_name: str,
-    handler: Callable[[PlannerState], PlannerState],
+    handler: PlannerNode,
     recorder: TraceRecorder | None = None,
-) -> Callable[[PlannerState], PlannerState]:
+) -> PlannerNode:
     """Wrap one business node with structured success/failure tracing.
 
     Stage one deliberately records summaries instead of complete State values. Recorder failures are
@@ -194,200 +157,10 @@ def _init_trace_context(state: PlannerState) -> PlannerState:
     return {"trace_context": context, "node_traces": [], "trace_events": []}
 
 
-def create_planning_graph(checkpointer: Any | None = None) -> Any:
-
-    # 创建一个状态图 
-    # add_node节点即不同的python函数 即声明功能
-    # add_edge即声明节点之间的流程编排顺序
-    graph = StateGraph(PlannerState)
-
-    # step0 在任何业务处理前创建 trace_id/run_id，保证前置节点异常也可以追踪。
-    graph.add_node("init_trace_context", _init_trace_context)
-
-    # step1 意图识别 state返回完整的意图识别结果和相关信息 都是从route_result中获
-    graph.add_node("classify_intent", traced_node("classify_intent", _classify_intent))
-
-    # step2 实体抽取 意图识别的result中直接提取entities
-    graph.add_node("extract_entities", traced_node("extract_entities", _extract_entities_node))
-
-    # step3 归一化实体 (让进入工具之前的实体完全符合工具要求)
-    graph.add_node("normalize_entities", traced_node("normalize_entities", _normalize_entities))
-
-    # step4 元数据解析前槽位校验: 只基于用户输入和实体抽取结果，判断是否具备最小可执行线索
-    # 典型阻断: 用户只说“查下游”，但没有给表名或表级业务术语
-    graph.add_node("validate_slots", traced_node("validate_slots", _validate_slots))
-
-    # step5 元数据候选解析: 优先查询 MySQL meta_table/meta_table_ext，失败时使用 mock fallback
-    # 典型转换: userInfo / 订单信息表 -> dwd.userInfo / dim.userInfo / dwd.orderInfo
-    graph.add_node(
-        "resolve_metadata_candidates",
-        traced_node("resolve_metadata_candidates", _resolve_metadata_candidates),
-    )
-
-    # step6 表级权限校验: 当前使用 YAML RBAC Provider，生产可替换统一权限中心 Provider
-    graph.add_node("authorize_context", traced_node("authorize_context", _authorize_context))
-
-    # step7 元数据解析后槽位校验: 判断候选表是否唯一、是否还缺关键槽位
-    graph.add_node("post_validate_slots", traced_node("post_validate_slots", _post_validate_slots))
-
-    # step8 📌 澄清决策: 判断缺槽位、多候选、无权限等是否需要先问用户
-    graph.add_node(
-        "decide_clarification_or_continue",
-        traced_node("decide_clarification_or_continue", _decide_clarification_or_continue),
-    )
-
-    # step9 构建计划
-    graph.add_node("build_task_plan", traced_node("build_task_plan", _build_task_plan))
-
-    # step10 生成澄清结果: conditional edge 命中后不继续生成工具计划
-    graph.add_node(
-        "return_clarification_result",
-        traced_node("return_clarification_result", _return_clarification_result),
-    )
-
-    # step10.1 持久化暂停点: 等待用户提交结构化澄清回答，然后回到实体标准化重新校验
-    graph.add_node("await_clarification_response", _await_clarification_response)
-
-    # step11 生成拒绝结果: conditional edge 命中后不继续生成工具计划
-    graph.add_node(
-        "return_forbidden_result",
-        traced_node("return_forbidden_result", _return_forbidden_result),
-    )
-
-    # step11.1 超过最大澄清轮数后转人工，避免 Agent 无限追问
-    graph.add_node(
-        "return_handoff_result",
-        traced_node("return_handoff_result", _return_handoff_result),
-    )
-
-    # step12 📌校验任务计划: 工具名、参数、依赖关系等
-    graph.add_node("validate_task_plan", traced_node("validate_task_plan", _validate_task_plan))
-
-    # step13 附加 trace: 记录路由、候选解析、权限、计划校验等备注
-    graph.add_node("attach_trace", _attach_trace)
-
-    # step14 返回计划结果
-    graph.add_node("return_planning_result", _return_planning_result)
-
-    # 设置整个图的first节点是什么 开始节点
-    graph.set_entry_point("init_trace_context")
-
-    # 设置节点之间的编排流程
-    graph.add_edge("init_trace_context", "classify_intent")
-    graph.add_edge("classify_intent", "extract_entities")
-    graph.add_edge("extract_entities", "normalize_entities")
-    graph.add_edge("normalize_entities", "validate_slots")
-    graph.add_edge("validate_slots", "resolve_metadata_candidates")
-    graph.add_edge("resolve_metadata_candidates", "authorize_context")
-    graph.add_edge("authorize_context", "post_validate_slots")
-    graph.add_edge("post_validate_slots", "decide_clarification_or_continue")
-    graph.add_conditional_edges(
-        "decide_clarification_or_continue", # startNode 开始执行的节点
-        _route_after_clarification_decision, # route path 回调函数 返回一个path路径
-        {                                    # path map 根据path路径 选择next node
-            "continue": "build_task_plan",
-            "clarify": "return_clarification_result",
-            "forbidden": "return_forbidden_result",
-            "handoff": "return_handoff_result",
-        },
-    )
-    graph.add_edge("build_task_plan", "validate_task_plan")
-    graph.add_edge("validate_task_plan", "attach_trace")
-    graph.add_edge("return_clarification_result", "attach_trace")
-    graph.add_edge("return_forbidden_result", "attach_trace")
-    graph.add_edge("return_handoff_result", "attach_trace")
-    graph.add_conditional_edges(
-        "attach_trace",
-        _route_after_trace,
-        {
-            "await_clarification": "await_clarification_response",
-            "return": "return_planning_result",
-        },
-    )
-    graph.add_edge("await_clarification_response", "normalize_entities")
-    graph.add_edge("return_planning_result", END)
-    return graph.compile(checkpointer=checkpointer or get_planner_checkpointer())
+# Graph topology lives in graph.py; this module contains executable nodes.
 
 
-class ClarificationProtocolError(ValueError):
-    """Raised when a clarification response is stale, mismatched, or unauthorized."""
-
-
-@lru_cache(maxsize=1)
-def get_planning_graph() -> Any:
-    """Return one compiled graph backed by the durable local SQLite checkpointer."""
-    return create_planning_graph(checkpointer=get_planner_checkpointer())
-
-
-def plan_question(
-    question: str,
-    access_context: AccessContext | None = None,
-    *,
-    thread_id: str | None = None,
-    max_clarification_rounds: int = 3,
-) -> PlanningResult:
-    """Plan a data question under an authenticated access context.
-
-    The default data_admin identity keeps the local learning CLI backward compatible. A production
-    API must construct AccessContext from its authenticated gateway instead of trusting request data.
-    """
-    app = get_planning_graph()
-    workflow_thread_id = thread_id or f"thread-{uuid4().hex}"
-    config = {"configurable": {"thread_id": workflow_thread_id}}
-    final_state = app.invoke(
-        {
-            "question": question,
-            "thread_id": workflow_thread_id,
-            "access_context": access_context
-            or AccessContext(user_id="demo-user", roles=["data_admin"], tenant_id="demo"),
-            "clarification_round": 0,
-            "max_clarification_rounds": max(1, max_clarification_rounds),
-            "state_version": 1,
-            "clarification_history": [],
-            "confirmed_slots": [],
-            "processed_idempotency_keys": [],
-        },
-        config=config,
-    )
-    return final_state["result"]
-
-
-def resume_clarification(response: ClarificationResponse) -> PlanningResult:
-    """验证外部回答并恢复对应的持久化 LangGraph 会话。
-
-    核心职责：
-    1. 使用 thread_id 从 SQLite checkpointer 读取最新状态快照。
-    2. 在恢复前检查幂等键；重复请求直接返回最新结果，不重复写实体或历史。
-    3. 确认当前图确实暂停在 await_clarification_response，拒绝向已结束会话注入回答。
-    4. 校验卡片 ID、版本和候选后，通过 Command(resume=...) 恢复原工作流。
-
-    面试总结：幂等校验放在 resume 入口而不是仅依赖前端，能够覆盖网络超时重试、重复点击
-    和消息队列重复投递；checkpoint snapshot 是判断会话状态的权威来源。
-    """
-    app = get_planning_graph()
-    config = {"configurable": {"thread_id": response.thread_id}}
-    snapshot = app.get_state(config)
-    state = snapshot.values
-    if not state:
-        raise ClarificationProtocolError(f"未找到 thread_id={response.thread_id} 的澄清会话。")
-
-    if response.idempotency_key in state.get("processed_idempotency_keys", []):
-        result = state.get("result")
-        if result is None:
-            raise ClarificationProtocolError("幂等请求已处理，但会话中缺少可返回结果。")
-        return result
-
-    result = state.get("result")
-    request = result.clarification_request if result else None
-    if request is None or "await_clarification_response" not in snapshot.next:
-        raise ClarificationProtocolError("当前会话不处于等待澄清状态。")
-    _validate_clarification_response(request, response)
-
-    resumed_state = app.invoke(Command(resume=response.model_dump(mode="json")), config=config)
-    resumed_result = resumed_state.get("result")
-    if resumed_result is None:
-        raise ClarificationProtocolError("澄清恢复后没有生成 PlanningResult。")
-    return resumed_result
+# Public start/resume use cases live in service.py.
 
 
 def _classify_intent(state: PlannerState) -> PlannerState:

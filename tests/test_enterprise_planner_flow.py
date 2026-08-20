@@ -1,6 +1,6 @@
-from data_agent.models import IntentType
-from data_agent.planner import plan_question
-from data_agent.slot_rules import load_slot_rule_config
+from data_agent.domain.models import IntentType
+from data_agent.application.planning.service import plan_question
+from data_agent.domain.slot_rules import load_slot_rule_config
 
 
 def test_enterprise_planner_notes_include_metadata_auth_validation_and_trace() -> None:

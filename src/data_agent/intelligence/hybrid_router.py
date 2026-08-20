@@ -5,11 +5,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from data_agent.classifier import RuleBasedIntentClassifier
-from data_agent.extractor import extract_entities_by_rules
-from data_agent.llm_analyzer import LLMAnalysis, LLMQuestionAnalyzer
-from data_agent.llm_client import LLMClientError
-from data_agent.models import ExtractedEntities, IntentType, TableIdentifier
+from data_agent.intelligence.classifier import RuleBasedIntentClassifier
+from data_agent.intelligence.extractor import extract_entities_by_rules
+from data_agent.intelligence.llm_analyzer import LLMAnalysis, LLMQuestionAnalyzer
+from data_agent.intelligence.llm_client import LLMClientError
+from data_agent.domain.models import ExtractedEntities, IntentType, TableIdentifier
 
 
 class EvidenceStrength(str, Enum):

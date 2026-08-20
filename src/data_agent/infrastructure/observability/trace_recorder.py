@@ -5,7 +5,7 @@ import logging
 from functools import lru_cache
 from typing import Protocol
 
-from data_agent.models import AgentRunStatus, NodeTrace, TraceContext, TraceEvent
+from data_agent.domain.models import AgentRunStatus, NodeTrace, TraceContext, TraceEvent
 
 
 class TraceRecorder(Protocol):

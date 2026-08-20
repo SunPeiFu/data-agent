@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
 
 import yaml
 from pydantic import BaseModel, Field
 
-from data_agent.models import AccessContext, AuthorizationDecision
+from data_agent.config.paths import CONFIG_DIR
+from data_agent.domain.models import AccessContext, AuthorizationDecision
 
 
 class AuthorizationProvider(Protocol):
@@ -88,7 +88,7 @@ class YamlAuthorizationProvider:
 @lru_cache(maxsize=1)
 def load_authorization_config() -> AuthorizationConfig:
     """Load and validate demo policies once per process."""
-    config_path = Path(__file__).resolve().parents[2] / "config" / "access_policies.yml"
+    config_path = CONFIG_DIR / "access_policies.yml"
     if not config_path.exists():
         return AuthorizationConfig()
     with config_path.open("r", encoding="utf-8") as file:

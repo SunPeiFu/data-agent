@@ -3,21 +3,20 @@ from uuid import uuid4
 
 import pytest
 
-from data_agent.models import (
+from data_agent.domain.models import (
     AgentRunStatus,
     ClarificationResponse,
     IntentType,
     NodeRunStatus,
     TraceContext,
 )
-from data_agent.planner import (
+from data_agent.application.planning.nodes import (
     _resolve_trace_run_status,
-    get_planning_graph,
-    plan_question,
-    resume_clarification,
     traced_node,
 )
-from data_agent.trace_recorder import InMemoryTraceRecorder
+from data_agent.application.planning.graph import get_planning_graph
+from data_agent.application.planning.service import plan_question, resume_clarification
+from data_agent.infrastructure.observability.trace_recorder import InMemoryTraceRecorder
 
 
 def _trace_context() -> TraceContext:

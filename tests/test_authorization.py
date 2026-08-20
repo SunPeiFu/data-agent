@@ -1,6 +1,7 @@
-from data_agent.authorization import YamlAuthorizationProvider
-from data_agent.models import AccessContext, DomainType, ExtractedEntities, IntentType, TableIdentifier
-from data_agent.planner import _authorize_context, plan_question
+from data_agent.infrastructure.security.authorization import YamlAuthorizationProvider
+from data_agent.domain.models import AccessContext, DomainType, ExtractedEntities, IntentType, TableIdentifier
+from data_agent.application.planning.nodes import _authorize_context
+from data_agent.application.planning.service import plan_question
 
 
 def test_data_analyst_can_read_marketing_lineage() -> None:

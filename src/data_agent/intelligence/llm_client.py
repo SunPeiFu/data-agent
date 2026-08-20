@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from data_agent.settings import LLMSettings
+from data_agent.config.settings import LLMSettings
 
 
 class LLMClientError(RuntimeError):

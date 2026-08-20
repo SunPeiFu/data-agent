@@ -1,6 +1,6 @@
 import pytest
 
-from data_agent.models import (
+from data_agent.domain.models import (
     ClarificationInputType,
     ClarificationResponse,
     ExtractedEntities,
@@ -10,13 +10,9 @@ from data_agent.models import (
     SlotValidationResult,
     SlotValidationStage,
 )
-from data_agent.planner import (
-    ClarificationProtocolError,
-    _all_slot_issues,
-    _build_clarification_request,
-    plan_question,
-    resume_clarification,
-)
+from data_agent.application.planning.errors import ClarificationProtocolError
+from data_agent.application.planning.nodes import _all_slot_issues, _build_clarification_request
+from data_agent.application.planning.service import plan_question, resume_clarification
 
 
 def test_clarification_prioritizes_table_before_governance_conflict() -> None:

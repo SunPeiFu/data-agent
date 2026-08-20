@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from data_agent.metadata_repository import MetadataCandidate
-from data_agent.milvus_repository import (
+from data_agent.infrastructure.repositories.mysql_metadata import MetadataCandidate
+from data_agent.infrastructure.repositories.milvus_metadata import (
     MilvusMetadataCandidate,
     MilvusSearchResponse,
     _build_scalar_filter,
 )
-from data_agent.models import (
+from data_agent.domain.models import (
     DataLayer,
     DomainType,
     ExtractedEntities,
@@ -17,7 +17,8 @@ from data_agent.models import (
     SlotIssueType,
     TableIdentifier,
 )
-from data_agent import planner
+from data_agent.application.planning import nodes as planner
+from data_agent.application.planning.service import plan_question
 
 
 def _mysql_candidate(full_table_name: str, table_name: str) -> MetadataCandidate:
@@ -148,7 +149,7 @@ def test_post_validation_blocks_mock_fallback_candidate(monkeypatch) -> None:
     monkeypatch.setattr(planner, "MySQLMetadataRepository", FailingMySQL)
     monkeypatch.setattr(planner, "MilvusMetadataRepository", FailIfCalledMilvus)
 
-    result = planner.plan_question("dwd.orderInfo 的下游血缘有哪些")
+    result = plan_question("dwd.orderInfo 的下游血缘有哪些")
 
     assert result.need_clarification is True
     assert result.task_steps == []

@@ -5,11 +5,11 @@
 ## P0：先串通现有骨架
 
 - [ ] 跑通三个核心 CLI case，确认 `intent/entities/task_steps/notes` 都能看懂。
-- [ ] 按顺序阅读 `planner.py`，理解企业级 DAG：
+- [ ] 按顺序阅读 `application/planning/`，理解企业级 DAG：
   `classify_intent -> extract_entities -> normalize_entities -> validate_slots -> resolve_metadata_candidates -> authorize_context -> post_validate_slots -> decide_clarification_or_continue -> build_task_plan/return_clarification_result/return_forbidden_result -> validate_task_plan -> attach_trace -> return_planning_result`
 - [ ] 重点理解 `hybrid_router.py` 的候选合并模型：
   `RuleEvidence -> FieldCandidate -> ResolvedField -> EntityResolution`
-- [ ] 重点理解 `task_builder.py` 的三类计划模板：
+- [ ] 重点理解 `domain/task_builder.py` 的三类计划模板：
   `metadata_search`、`lineage_search`、`impact_analysis`
 - [ ] 用 `pytest -q` 保证现有测试全部通过。
 - [x] 给 `normalize_entities` 增加生产化基础能力：

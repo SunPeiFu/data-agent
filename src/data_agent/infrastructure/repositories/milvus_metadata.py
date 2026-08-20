@@ -7,8 +7,8 @@ from typing import Any
 
 import httpx
 
-from data_agent.models import ExtractedEntities
-from data_agent.settings import EmbeddingSettings
+from data_agent.domain.models import ExtractedEntities
+from data_agent.config.settings import EmbeddingSettings
 
 
 class MilvusRepositoryError(RuntimeError):

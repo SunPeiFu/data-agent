@@ -1,6 +1,6 @@
-from data_agent.hybrid_router import ConflictResolution, PolicyResolver, RulePreAnalysis
-from data_agent.llm_analyzer import LLMAnalysis
-from data_agent.models import ExtractedEntities, IntentType, LineageDirection, OperationType, TableIdentifier
+from data_agent.intelligence.hybrid_router import ConflictResolution, PolicyResolver, RulePreAnalysis
+from data_agent.intelligence.llm_analyzer import LLMAnalysis
+from data_agent.domain.models import ExtractedEntities, IntentType, LineageDirection, OperationType, TableIdentifier
 
 
 def test_policy_resolver_strong_rule_intent_overrides_llm_conflict() -> None:

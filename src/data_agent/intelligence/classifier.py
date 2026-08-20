@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from data_agent.llm_analyzer import LLMQuestionAnalyzer
-from data_agent.llm_client import LLMClientError
-from data_agent.models import IntentType
+from data_agent.intelligence.llm_analyzer import LLMQuestionAnalyzer
+from data_agent.intelligence.llm_client import LLMClientError
+from data_agent.domain.models import IntentType
 
 
 class RuleBasedIntentClassifier:

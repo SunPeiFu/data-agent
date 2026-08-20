@@ -1,6 +1,6 @@
-from data_agent.extractor import extract_entities
-from data_agent.models import DataLayer, DomainType, IntentType, LineageDirection, OperationType, TableIdentifier
-from data_agent.planner import plan_question
+from data_agent.intelligence.extractor import extract_entities
+from data_agent.domain.models import DataLayer, DomainType, IntentType, LineageDirection, OperationType, TableIdentifier
+from data_agent.application.planning.service import plan_question
 
 
 def test_case_1_metadata_search_plan_contains_tidb_and_milvus() -> None:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
 
-from data_agent.models import NormalizedTerm, NormalizedTermType
+from data_agent.config.paths import CONFIG_DIR
+from data_agent.domain.models import NormalizedTerm, NormalizedTermType
 
 
 class SynonymRule(BaseModel):
@@ -64,7 +64,7 @@ class NormalizationConfig(BaseModel):
 
 @lru_cache(maxsize=1)
 def load_normalization_config() -> NormalizationConfig:
-    config_path = Path(__file__).resolve().parents[2] / "config" / "normalization.yml"
+    config_path = CONFIG_DIR / "normalization.yml"
     if not config_path.exists():
         return NormalizationConfig()
     with config_path.open("r", encoding="utf-8") as file:

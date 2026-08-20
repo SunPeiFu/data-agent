@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
 
-from data_agent.models import IntentType, SlotIssueType
+from data_agent.config.paths import CONFIG_DIR
+from data_agent.domain.models import IntentType, SlotIssueType
 
 
 class IntentSlotRule(BaseModel):
@@ -37,7 +37,7 @@ class SlotRuleConfig(BaseModel):
 
 @lru_cache(maxsize=1)
 def load_slot_rule_config() -> SlotRuleConfig:
-    config_path = Path(__file__).resolve().parents[2] / "config" / "slot_rules.yml"
+    config_path = CONFIG_DIR / "slot_rules.yml"
     if not config_path.exists():
         return SlotRuleConfig()
     with config_path.open("r", encoding="utf-8") as file:

@@ -30,7 +30,8 @@ def get_planner_checkpointer() -> SqliteSaver:
 
 def _trusted_state_types() -> list[type]:
     """Allow only project-owned Pydantic models and enums during checkpoint deserialization."""
-    from data_agent import hybrid_router, llm_analyzer, models
+    from data_agent.domain import models
+    from data_agent.intelligence import hybrid_router, llm_analyzer
 
     trusted: list[type] = []
     for module in [models, hybrid_router, llm_analyzer]:

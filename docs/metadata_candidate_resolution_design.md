@@ -113,7 +113,7 @@ export DATA_AGENT_MILVUS_MIN_SCORE_GAP="0"
 
 ```bash
 docker compose -f docker-compose.milvus.yml up -d
-conda run -n python-agent python -m data_agent.milvus_schema
+conda run -n python-agent python -m data_agent.infrastructure.repositories.milvus_schema
 ```
 
 服务地址：

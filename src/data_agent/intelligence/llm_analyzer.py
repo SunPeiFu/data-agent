@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, ValidationError
 
-from data_agent.llm_client import LLMClientError, OpenAICompatibleChatClient
-from data_agent.models import (
+from data_agent.intelligence.llm_client import LLMClientError, OpenAICompatibleChatClient
+from data_agent.domain.models import (
     DataLayer,
     DomainType,
     ExtractedEntities,

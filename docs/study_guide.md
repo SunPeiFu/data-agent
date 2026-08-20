@@ -80,7 +80,7 @@ docs/design.md
 重点看：
 
 ```text
-src/data_agent/models.py
+src/data_agent/domain/models.py
 ```
 
 优先级从高到低：
@@ -118,7 +118,7 @@ PlanningResult = intent + entities + task_steps + clarification + notes
 
 ```bash
 python - <<'PY'
-from data_agent.models import TableIdentifier
+from data_agent.domain.models import TableIdentifier
 
 for name in ["catalog.dwd.orderInfo", "dwd.orderInfo", "userInfo"]:
     print(TableIdentifier.parse(name).model_dump())
@@ -138,7 +138,7 @@ PY
 先看：
 
 ```text
-src/data_agent/classifier.py
+src/data_agent/intelligence/classifier.py
 ```
 
 只记三条规则：
@@ -150,7 +150,7 @@ src/data_agent/classifier.py
 再看：
 
 ```text
-src/data_agent/extractor.py
+src/data_agent/intelligence/extractor.py
 ```
 
 重点看这些函数：
@@ -171,8 +171,8 @@ src/data_agent/extractor.py
 
 ```bash
 python - <<'PY'
-from data_agent.classifier import RuleBasedIntentClassifier
-from data_agent.extractor import extract_entities
+from data_agent.intelligence.classifier import RuleBasedIntentClassifier
+from data_agent.intelligence.extractor import extract_entities
 
 q = "营销域下的 dwd层的userInfo表修改，关联影响的上游和下游表有哪些"
 print(RuleBasedIntentClassifier().classify(q))
@@ -193,7 +193,7 @@ PY
 重点看：
 
 ```text
-src/data_agent/task_builder.py
+src/data_agent/domain/task_builder.py
 ```
 
 这是整个项目最值得面试展开讲的文件。
@@ -289,7 +289,7 @@ impact_analyzer.merge_lineage_and_metadata
 重点看：
 
 ```text
-src/data_agent/planner.py
+src/data_agent/application/planning/
 ```
 
 只记住这条图：
@@ -403,11 +403,11 @@ pytest -q
 按优先级排序：
 
 1. `docs/interview_notes.md`
-2. `src/data_agent/models.py`
-3. `src/data_agent/task_builder.py`
-4. `src/data_agent/extractor.py`
-5. `src/data_agent/classifier.py`
-6. `src/data_agent/planner.py`
+2. `src/data_agent/domain/models.py`
+3. `src/data_agent/domain/task_builder.py`
+4. `src/data_agent/intelligence/extractor.py`
+5. `src/data_agent/intelligence/classifier.py`
+6. `src/data_agent/application/planning/`
 7. `tests/test_planner.py`
 8. `src/data_agent/cli.py`
 9. `docs/design.md`

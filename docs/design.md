@@ -4,6 +4,19 @@
 
 v1 目标是实现一个可面试、可学习、可扩展的 Agent Planner。它不直接回答业务问题，而是把问题转成结构化执行计划。
 
+## 代码分层
+
+- `application/planning/graph.py`：只负责 LangGraph 拓扑。
+- `application/planning/state.py`：定义跨节点状态契约。
+- `application/planning/service.py`：负责开始和恢复 Planner 用例。
+- `application/planning/nodes.py`：实现业务节点。
+- `domain/`：领域模型、归一化、槽位规则和任务计划。
+- `intelligence/`：规则、LLM 和 Hybrid Router。
+- `infrastructure/`：MySQL、Milvus、权限、checkpoint 和 Trace Adapter。
+- `interfaces/`：CLI 和未来 HTTP API。
+
+详细设计见 `docs/package_architecture.md`。
+
 ## 数据流
 
 ```text

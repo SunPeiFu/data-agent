@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
-from data_agent.models import ExtractedEntities, TableIdentifier
+from data_agent.domain.models import ExtractedEntities, TableIdentifier
 
 
 class MetadataRepositoryError(RuntimeError):
