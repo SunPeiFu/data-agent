@@ -282,9 +282,9 @@ def create_planning_graph(checkpointer: Any | None = None) -> Any:
     graph.add_edge("authorize_context", "post_validate_slots")
     graph.add_edge("post_validate_slots", "decide_clarification_or_continue")
     graph.add_conditional_edges(
-        "decide_clarification_or_continue",
-        _route_after_clarification_decision,
-        {
+        "decide_clarification_or_continue", # startNode 开始执行的节点
+        _route_after_clarification_decision, # route path 回调函数 返回一个path路径
+        {                                    # path map 根据path路径 选择next node
             "continue": "build_task_plan",
             "clarify": "return_clarification_result",
             "forbidden": "return_forbidden_result",
