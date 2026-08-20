@@ -20,6 +20,32 @@ python -m data_agent.cli plan "安逸花 dwd 层 dwd.orderInfo 中的字段修�
 python -m data_agent.cli plan "营销域下的 dwd层的userInfo表修改字段，关联影响的上游和下游表有哪些"
 ```
 
+权限演示可以通过角色切换。`data_analyst` 只能读取营销域元数据和血缘，
+`data_admin` 可执行全部动作：
+
+```bash
+python -m data_agent.cli plan \
+  "营销域 DWD 层 dwd.payment_detail 表的下游血缘有哪些" \
+  --user-id analyst-1 --role data_analyst
+```
+
+遇到多候选时，结果中的 `clarification_request` 会返回 `thread_id`、
+`clarification_id`、`state_version` 和候选 `option_id`。提交选择后，LangGraph 从
+SQLite checkpoint 恢复，并重新执行元数据和权限校验：
+
+```bash
+python -m data_agent.cli resume \
+  --thread-id "卡片中的 thread_id" \
+  --clarification-id "卡片中的 clarification_id" \
+  --option-id "选项中的 option_id" \
+  --value "dwd.orderInfo" \
+  --state-version 1 \
+  --idempotency-key "request-001"
+```
+
+checkpoint 默认写入 `.data-agent/checkpoints.sqlite3`，可通过
+`DATA_AGENT_CHECKPOINT_DB` 修改路径。
+
 ## 接入本地 LM Studio
 
 项目使用 OpenAI-compatible `/v1/chat/completions` 协议。LM Studio 启动本地服务后，配置：

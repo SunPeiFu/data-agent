@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
@@ -68,11 +69,11 @@ class NormalizationTrace(BaseModel):
 
 class SlotIssueType(str, Enum):
     MISSING = "missing"
-    AMBIGUOUS = "ambiguous"
-    INVALID = "invalid"
-    CONFLICT = "conflict"
-    FORBIDDEN = "forbidden"
-    LOW_CONFIDENCE = "low_confidence"
+    AMBIGUOUS = "ambiguous" # 模糊的
+    INVALID = "invalid" # 无效
+    CONFLICT = "conflict" # 冲突
+    FORBIDDEN = "forbidden" # 拒绝
+    LOW_CONFIDENCE = "low_confidence" #低置信度
 
 
 class SlotValidationStage(str, Enum):
@@ -109,11 +110,150 @@ class MetadataCandidateEvidence(BaseModel):
     retrieval_mode: str | None = None
 
 
+class AccessContext(BaseModel):
+    """Authenticated subject context passed into the planning workflow."""
+
+    user_id: str
+    roles: list[str] = Field(default_factory=list)
+    tenant_id: str | None = None
+    allowed_domains: list[str] = Field(default_factory=list)
+    allowed_actions: list[str] = Field(default_factory=list)
+
+
+class AuthorizationDecision(BaseModel):
+    """Auditable authorization result for one action-resource pair."""
+
+    allowed: bool
+    action: str
+    resource: str | None = None
+    policy_id: str | None = None
+    reason_code: str
+    audit_id: str
+
+
+class AgentRunStatus(str, Enum):
+    """Lifecycle status for one initial, resume, retry, or replan execution."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    INTERRUPTED = "interrupted"
+    FORBIDDEN = "forbidden"
+    HANDOFF = "handoff"
+    FAILED = "failed"
+
+
+class NodeRunStatus(str, Enum):
+    """Execution status for one traced LangGraph business node."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class TraceContext(BaseModel):
+    """Identifiers shared by every span in one Agent execution segment."""
+
+    trace_id: str
+    run_id: str
+    thread_id: str
+    parent_run_id: str | None = None
+    planner_version: str
+    started_at: datetime
+
+
+class NodeTrace(BaseModel):
+    """Structured span for one LangGraph business node execution."""
+
+    node_run_id: str
+    trace_id: str
+    run_id: str
+    node_name: str
+    status: NodeRunStatus
+    started_at: datetime
+    finished_at: datetime | None = None
+    duration_ms: float | None = None
+    input_summary: dict[str, Any] = Field(default_factory=dict)
+    output_summary: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class TraceEvent(BaseModel):
+    """Structured business decision event attached to a trace and node."""
+
+    event_id: str
+    trace_id: str
+    run_id: str
+    node_name: str
+    event_type: str
+    reason_code: str | None = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
 class SlotIssue(BaseModel):
     slot_name: str
     issue_type: SlotIssueType
     message: str
     blocking: bool = True
+
+
+class ClarificationInputType(str, Enum):
+    """Frontend control used to collect one clarification answer."""
+
+    SINGLE_SELECT = "single_select"
+    TEXT = "text"
+    CONFIRM = "confirm"
+
+
+class ClarificationOption(BaseModel):
+    """One authorized option displayed in a clarification card."""
+
+    option_id: str
+    label: str
+    value: str
+    description: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ClarificationRequest(BaseModel):
+    """Structured human-in-the-loop payload returned to a UI or API client."""
+
+    clarification_id: str
+    thread_id: str
+    question: str
+    slot_name: str
+    issue_type: SlotIssueType
+    input_type: ClarificationInputType
+    options: list[ClarificationOption] = Field(default_factory=list)
+    required: bool = True
+    allow_custom_value: bool = False
+    pending_issue_count: int = 0
+    state_version: int = 1
+    clarification_round: int = 1
+    max_clarification_rounds: int = 3
+
+
+class ClarificationResponse(BaseModel):
+    """Versioned client response reserved for the future LangGraph resume endpoint."""
+
+    clarification_id: str
+    thread_id: str
+    value: str = Field(min_length=1)
+    option_id: str | None = None
+    state_version: int = 1
+    idempotency_key: str = Field(min_length=1)
+
+
+class ClarificationAnswerRecord(BaseModel):
+    """Auditable user-confirmed slot value retained across clarification rounds."""
+
+    slot_name: str
+    value: str
+    source: str = "user_confirmed"
+    confidence: float = 1.0
+    clarification_round: int
+    idempotency_key: str
 
 
 class SlotValidationResult(BaseModel):
@@ -190,6 +330,15 @@ class PlanningResult(BaseModel):
     task_steps: list[TaskStep] = Field(default_factory=list)
     need_clarification: bool = False
     clarification_question: str | None = None
+    clarification_request: ClarificationRequest | None = None
+    pending_clarification_issues: list[SlotIssue] = Field(default_factory=list)
+    clarification_history: list[ClarificationAnswerRecord] = Field(default_factory=list)
+    handoff_required: bool = False
+    handoff_reason: str | None = None
+    thread_id: str | None = None
+    trace_id: str | None = None
+    run_id: str | None = None
+    parent_run_id: str | None = None
     notes: list[str] = Field(default_factory=list)
     normalized_terms: list[NormalizedTerm] = Field(default_factory=list)
     normalization_traces: list[NormalizationTrace] = Field(default_factory=list)

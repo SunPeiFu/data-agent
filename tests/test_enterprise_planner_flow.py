@@ -16,8 +16,10 @@ def test_enterprise_planner_notes_include_metadata_auth_validation_and_trace() -
     assert "计划校验: intent=impact_analysis 工具组合契约通过。" in notes
     assert "计划校验: 表元数据候选状态通过。" in notes
     assert "计划校验: 执行策略边界通过。" in notes
-    assert "Trace: trace_id=plan-" in notes
-    assert "planner_version=v1-enterprise-mock" in notes
+    assert "Trace: trace_id=trace-" in notes
+    assert ", run_id=run-" in notes
+    assert "run_status=completed" in notes
+    assert "planner_version=v1-enterprise-planner" in notes
 
 
 def test_enterprise_planner_one_part_table_uses_layer_to_narrow_candidates() -> None:

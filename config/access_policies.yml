@@ -1,0 +1,27 @@
+roles:
+  data_analyst:
+    allowed_actions:
+      - metadata:read
+      - lineage:read
+    allowed_domains:
+      - 营销域
+    allowed_biz_lines:
+      - 安逸花
+
+  impact_analyst:
+    allowed_actions:
+      - metadata:read
+      - lineage:read
+      - impact:analyze
+    allowed_domains:
+      - 营销域
+    allowed_biz_lines:
+      - 安逸花
+
+  data_admin:
+    allowed_actions:
+      - "*"
+    allowed_domains:
+      - "*"
+    allowed_biz_lines:
+      - "*"
