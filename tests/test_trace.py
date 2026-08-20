@@ -108,6 +108,7 @@ def test_full_planner_records_every_business_node_span() -> None:
         "classify_intent",
         "extract_entities",
         "normalize_entities",
+        "determine_metadata_query_mode",
         "validate_slots",
         "resolve_metadata_candidates",
         "authorize_context",

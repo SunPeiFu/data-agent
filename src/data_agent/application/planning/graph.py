@@ -7,6 +7,13 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 
+from data_agent.application.execution.nodes import (
+    _collect_observations,
+    _execute_task_plan,
+    _return_plan_validation_failure,
+    _route_after_plan_validation,
+)
+
 from data_agent.application.planning.nodes import (
     _attach_trace,
     _authorize_context,
@@ -14,6 +21,7 @@ from data_agent.application.planning.nodes import (
     _build_task_plan,
     _classify_intent,
     _decide_clarification_or_continue,
+    _determine_metadata_query_mode,
     _extract_entities_node,
     _init_trace_context,
     _normalize_entities,
@@ -41,6 +49,10 @@ def create_planning_graph(checkpointer: Any | None = None) -> Any:
     graph.add_node("classify_intent", traced_node("classify_intent", _classify_intent))
     graph.add_node("extract_entities", traced_node("extract_entities", _extract_entities_node))
     graph.add_node("normalize_entities", traced_node("normalize_entities", _normalize_entities))
+    graph.add_node(
+        "determine_metadata_query_mode",
+        traced_node("determine_metadata_query_mode", _determine_metadata_query_mode),
+    )
     graph.add_node("validate_slots", traced_node("validate_slots", _validate_slots))
     graph.add_node(
         "resolve_metadata_candidates",
@@ -67,6 +79,12 @@ def create_planning_graph(checkpointer: Any | None = None) -> Any:
         traced_node("return_handoff_result", _return_handoff_result),
     )
     graph.add_node("validate_task_plan", traced_node("validate_task_plan", _validate_task_plan))
+    graph.add_node("execute_task_plan", traced_node("execute_task_plan", _execute_task_plan))
+    graph.add_node("collect_observations", traced_node("collect_observations", _collect_observations))
+    graph.add_node(
+        "return_plan_validation_failure",
+        traced_node("return_plan_validation_failure", _return_plan_validation_failure),
+    )
     graph.add_node("attach_trace", _attach_trace)
     graph.add_node("return_planning_result", _return_planning_result)
 
@@ -74,7 +92,8 @@ def create_planning_graph(checkpointer: Any | None = None) -> Any:
     graph.add_edge("init_trace_context", "classify_intent")
     graph.add_edge("classify_intent", "extract_entities")
     graph.add_edge("extract_entities", "normalize_entities")
-    graph.add_edge("normalize_entities", "validate_slots")
+    graph.add_edge("normalize_entities", "determine_metadata_query_mode")
+    graph.add_edge("determine_metadata_query_mode", "validate_slots")
     graph.add_edge("validate_slots", "resolve_metadata_candidates")
     graph.add_edge("resolve_metadata_candidates", "authorize_context")
     graph.add_edge("authorize_context", "post_validate_slots")
@@ -90,7 +109,22 @@ def create_planning_graph(checkpointer: Any | None = None) -> Any:
         },
     )
     graph.add_edge("build_task_plan", "validate_task_plan")
-    graph.add_edge("validate_task_plan", "attach_trace")
+    graph.add_conditional_edges(
+        "validate_task_plan",
+        _route_after_plan_validation,
+        {
+            "execute": "execute_task_plan",
+            "return_plan": "attach_trace",
+            "rejected": "return_plan_validation_failure",
+            "replan_required": "return_plan_validation_failure",
+            "clarification_required": "return_plan_validation_failure",
+            "approval_required": "return_plan_validation_failure",
+            "forbidden": "return_plan_validation_failure",
+        },
+    )
+    graph.add_edge("execute_task_plan", "collect_observations")
+    graph.add_edge("collect_observations", "attach_trace")
+    graph.add_edge("return_plan_validation_failure", "attach_trace")
     graph.add_edge("return_clarification_result", "attach_trace")
     graph.add_edge("return_forbidden_result", "attach_trace")
     graph.add_edge("return_handoff_result", "attach_trace")

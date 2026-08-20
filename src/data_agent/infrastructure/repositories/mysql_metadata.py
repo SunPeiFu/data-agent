@@ -194,11 +194,56 @@ class MySQLMetadataRepository:
         """
         return self._fetch_candidates(sql, tuple(unique_names), entities)
 
+    def filter_tables(
+        self,
+        entities: ExtractedEntities,
+        topic_keywords: list[str],
+        limit: int = 20,
+    ) -> list[MetadataCandidate]:
+        """Search a result set of table assets using structured filters and text keywords."""
+        conditions = ["t.lifecycle_status = 'online'"]
+        params: list[Any] = []
+        if entities.biz_line:
+            conditions.append("t.biz_line = %s")
+            params.append(entities.biz_line)
+        if entities.domain:
+            conditions.append("t.domain = %s")
+            params.append(entities.domain.value)
+        if entities.data_layer:
+            conditions.append("t.data_layer = %s")
+            params.append(entities.data_layer.value)
+        for keyword in _unique(topic_keywords):
+            conditions.append(
+                "(t.table_name LIKE %s OR t.table_comment LIKE %s OR EXISTS ("
+                "SELECT 1 FROM meta_table_ext e WHERE e.table_id = t.id "
+                "AND (e.term_value LIKE %s OR e.normalized_term LIKE %s)))"
+            )
+            like_value = f"%{keyword}%"
+            params.extend([like_value, like_value, like_value, like_value])
+        sql = f"""
+            SELECT DISTINCT t.*
+            FROM meta_table t
+            WHERE {' AND '.join(conditions)}
+            ORDER BY t.updated_at DESC, t.full_table_name
+            LIMIT %s
+        """
+        params.append(max(1, min(limit, 100)))
+        return self._fetch_candidates(sql, tuple(params), entities, preserve_query_order=True)
+
+    def get_table_detail(self, table_name: str) -> MetadataCandidate | None:
+        """Read one canonical table asset for the metadata detail tool."""
+        table = TableIdentifier.parse(table_name)
+        candidates = self.find_by_table_identifier(table, ExtractedEntities(table=table))
+        exact = [candidate for candidate in candidates if candidate.full_table_name == table.raw]
+        selected = exact or candidates
+        return selected[0] if len(selected) == 1 else None
+
     def _fetch_candidates(
         self,
         sql: str,
         params: tuple[Any, ...],
         entities: ExtractedEntities,
+        preserve_query_order: bool = False,
     ) -> list[MetadataCandidate]:
         """Execute SQL and convert rows into sorted MetadataCandidate objects.
 
@@ -238,6 +283,8 @@ class MySQLMetadataRepository:
             connection.close()
 
         candidates = [MetadataCandidate.from_row(row, entities) for row in rows]
+        if preserve_query_order:
+            return candidates
         return sorted(candidates, key=lambda candidate: (-candidate.score, candidate.full_table_name))
 
 

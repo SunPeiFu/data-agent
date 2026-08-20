@@ -13,6 +13,7 @@ from data_agent.domain.models import (
     IntentType,
     MetadataCandidateEvidence,
     MetadataCandidateSource,
+    MetadataQueryMode,
     MetadataValidationStatus,
     SlotIssueType,
     TableIdentifier,
@@ -34,6 +35,70 @@ def _mysql_candidate(full_table_name: str, table_name: str) -> MetadataCandidate
         owner="data-team",
         score=7,
     )
+
+
+def test_metadata_discovery_skips_candidate_repositories(monkeypatch) -> None:
+    class FailIfConstructed:
+        def __init__(self):
+            raise AssertionError("discovery planning must not query candidate repositories")
+
+    monkeypatch.setattr(planner, "MySQLMetadataRepository", FailIfConstructed)
+    monkeypatch.setattr(planner, "MilvusMetadataRepository", FailIfConstructed)
+    state = {
+        "question": "营销域 DWD 层支付相关表有哪些",
+        "intent": IntentType.METADATA_SEARCH,
+        "metadata_query_mode": MetadataQueryMode.DISCOVERY,
+        "entities": ExtractedEntities(
+            domain=DomainType.MARKETING,
+            data_layer=DataLayer.DWD,
+            topic_keywords=["支付"],
+        ),
+        "semantic_table_query": "营销域 DWD 层支付相关表有哪些",
+    }
+
+    resolved = planner._resolve_metadata_candidates(state)
+
+    assert resolved["metadata_candidates"] == {}
+    assert any("discovery 模式跳过" in note for note in resolved["metadata_notes"])
+
+
+def test_metadata_mode_prefers_collection_expression_over_explicit_table() -> None:
+    state = {
+        "question": "查找与 dwd.orderInfo 相关的表有哪些",
+        "intent": IntentType.METADATA_SEARCH,
+        "entities": ExtractedEntities(table=TableIdentifier.parse("dwd.orderInfo")),
+    }
+
+    classified = planner._determine_metadata_query_mode(state)
+
+    assert classified["metadata_query_mode"] == MetadataQueryMode.DISCOVERY
+
+
+def test_metadata_mode_treats_business_term_as_detail_target() -> None:
+    state = {
+        "question": "订单信息表的负责人是谁",
+        "intent": IntentType.METADATA_SEARCH,
+        "entities": ExtractedEntities(),
+        "table_term_candidates": {"订单信息表": ["dwd.orderInfo"]},
+    }
+
+    classified = planner._determine_metadata_query_mode(state)
+
+    assert classified["metadata_query_mode"] == MetadataQueryMode.DETAIL
+
+
+def test_metadata_detail_blocks_multiple_table_candidates() -> None:
+    state = {
+        "intent": IntentType.METADATA_SEARCH,
+        "metadata_query_mode": MetadataQueryMode.DETAIL,
+        "entities": ExtractedEntities(table=TableIdentifier.parse("orderInfo")),
+        "metadata_candidates": {"table": ["dwd.orderInfo", "ods.orderInfo"]},
+    }
+
+    validation = planner._post_validate_slots(state)["post_slot_validation"]
+
+    assert validation.passed is False
+    assert any(issue.issue_type == SlotIssueType.AMBIGUOUS for issue in validation.issues)
 
 
 def test_exact_identifier_uses_mysql_and_skips_milvus(monkeypatch) -> None:

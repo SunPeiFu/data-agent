@@ -1,11 +1,11 @@
 # 智能数据探查
 
-面向真实面试和代码学习的 Agent 项目。当前已实现意图识别、实体标准化、槽位校验、MySQL 元数据候选解析，以及 Milvus 表资产混合召回接入。
+面向真实面试和代码学习的 Agent 项目。当前已实现从意图理解、实体治理、任务拆解到注册工具执行和 Observation 收集的完整表级 DataAgent 链路。
 
 ## 技术选型
 
-- Python 3.11
-- LangGraph + LangChain
+- Python 3.11.15
+- LangGraph 1.1.x + LangChain 1.2.x
 - Pydantic
 - pytest
 
@@ -25,12 +25,14 @@ Pydantic 模型属于 `domain`。
 | 包 | 概念定义 | 当前职责 | 后续典型内容 |
 | --- | --- | --- | --- |
 | `data_agent` | 项目的稳定公共边界 | 对外暴露 `plan_question`、`resume_clarification` 等公共 API；保留 CLI 模块入口 | 只增加经过确认的稳定 API，不放具体业务实现 |
-| `application` | 应用用例编排层，负责协调领域能力完成一次用户任务 | 承载“开始规划”“恢复澄清”等用例，组织 LangGraph 工作流 | 工具执行用例、答案生成用例、人工转交流程 |
+| `application` | 应用用例编排层，负责协调领域能力完成一次用户任务 | 承载规划、执行、Observation 收集和恢复澄清等用例 | 答案生成用例、人工转交流程 |
 | `application.planning` | 智能数据探查 Planner 的独立 Agent/工作流边界 | 分离 Graph 拓扑、State 契约、Node 实现、Service 入口和应用异常 | 将来可与 `lineage_agent`、`quality_agent` 等并列 |
+| `application.execution` | 已校验任务计划的执行编排层 | 执行 TaskStep DAG、收集工具 Observation 和 TraceEvent | 重规划、结果生成和人工审批 |
 | `domain` | 与框架和数据库无关的核心业务知识 | 定义意图、实体、表标识、槽位、任务步骤等模型，以及归一化规则和计划模板 | 血缘深度策略、影响等级规则、业务术语规则 |
 | `intelligence` | 将非结构化自然语言转换成结构化业务语义的智能理解层 | 规则预分析、LLM 结构化解析、Hybrid Router、冲突合并与兜底 | Prompt 版本、模型路由、意图评测、实体解析策略 |
 | `infrastructure` | 对数据库、向量库、权限中心、存储和观测系统的技术适配层 | 汇总所有外部系统 Adapter，实现上层需要的能力边界 | Neo4j、TiDB、Redis、IAM、OpenTelemetry Adapter |
-| `infrastructure.repositories` | 数据访问适配包 | 封装 MySQL 元数据查询、Milvus 混合召回和 Collection 初始化 | Neo4j 血缘 Repository、真实 TiDB Repository |
+| `infrastructure.repositories` | 数据访问适配包 | 封装 MySQL 元数据查询、Milvus 混合召回、Neo4j 表级血缘和 Collection 初始化 | 真实 TiDB/Data Catalog Repository |
+| `tools` | Agent 可执行能力边界 | LangChain Tool 输入输出契约、实现、Registry、动态权限发现和 DAG Executor | MCP Provider、远程工具目录和熔断策略 |
 | `infrastructure.security` | 安全与权限系统适配包 | 通过统一 Provider 执行 subject-action-resource 权限判定 | IAM、Apache Ranger 或公司权限中心 HTTP Provider |
 | `infrastructure.persistence` | Agent 工作流状态持久化适配包 | 提供 LangGraph SQLite Checkpointer | Postgres Checkpointer、会话与 Run Repository |
 | `infrastructure.observability` | Agent 可观测性适配包 | 记录 Run、Node 和 TraceEvent，隔离 Trace 后端故障 | MySQL Trace Recorder、OpenTelemetry、LangSmith |
@@ -71,6 +73,10 @@ pip install -e ".[dev]"
 python -m data_agent.cli plan "安逸花业务线营销域下DWD层关于支付的表有哪些"
 python -m data_agent.cli plan "安逸花 dwd 层 dwd.orderInfo 中的字段修改，对下游哪些表产生影响"
 python -m data_agent.cli plan "营销域下的 dwd层的userInfo表修改字段，关联影响的上游和下游表有哪些"
+
+# 显式进入真实工具执行分支
+python -m data_agent.cli run "查询 dwd.orderInfo 表说明和负责人"
+python -m data_agent.cli run "安逸花业务线营销域下DWD层关于支付的表有哪些"
 ```
 
 权限演示可以通过角色切换。`data_analyst` 只能读取营销域元数据和血缘，
@@ -142,11 +148,4 @@ pytest -q
 
 ## 当前边界
 
-当前输出的是结构化执行计划：
-
-- TiDB 元数据查询计划
-- Milvus RAG 语义召回计划
-- Neo4j 血缘查询计划
-- 影响分析与结果融合计划
-
-真实工具调用、最终答案生成、FastAPI 服务层会在后续阶段落地。
+`plan` 只返回经过结构化执行闸门批准的计划；闸门校验 DAG、Schema、数据流、权限和运行策略，并用 plan hash 防止校验后篡改。`run` 会执行 TiDB/MySQL 元数据、Milvus 混合召回、Neo4j 血缘、影响分析和结果融合工具，并返回 `tool_observations/final_output`。Neo4j 需要通过 `DATA_AGENT_NEO4J_*` 配置真实实例。最终自然语言答案生成、MCP 和 FastAPI 服务层仍在 TODO 中。

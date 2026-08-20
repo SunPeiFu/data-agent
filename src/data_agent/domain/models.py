@@ -13,6 +13,13 @@ class IntentType(str, Enum):
     IMPACT_ANALYSIS = "impact_analysis"
     UNKNOWN = "unknown"
 
+
+class MetadataQueryMode(str, Enum):
+    """Distinguish set-valued asset discovery from one-table metadata lookup."""
+
+    DISCOVERY = "discovery"
+    DETAIL = "detail"
+
 # 定义枚举 血缘方向
 class LineageDirection(str, Enum):
     UPSTREAM = "upstream"
@@ -140,6 +147,9 @@ class AgentRunStatus(str, Enum):
     FORBIDDEN = "forbidden"
     HANDOFF = "handoff"
     FAILED = "failed"
+    REPLAN_REQUIRED = "replan_required"
+    VALIDATION_FAILED = "validation_failed"
+    APPROVAL_REQUIRED = "approval_required"
 
 
 class NodeRunStatus(str, Enum):
@@ -318,8 +328,79 @@ class TaskStep(BaseModel):
     tool_name: str
     action: str
     params: dict[str, Any] = Field(default_factory=dict)
+    input_bindings: dict[str, int] = Field(default_factory=dict)
     depends_on: list[int] = Field(default_factory=list)
     parallel_group: str | None = None
+
+
+class ToolCallStatus(str, Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    FORBIDDEN = "forbidden"
+    SKIPPED = "skipped"
+    TIMEOUT = "timeout"
+
+
+class TaskExecutionStatus(str, Enum):
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class PlanValidationStatus(str, Enum):
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    REPLAN_REQUIRED = "replan_required"
+    CLARIFICATION_REQUIRED = "clarification_required"
+    APPROVAL_REQUIRED = "approval_required"
+    FORBIDDEN = "forbidden"
+
+
+class ViolationSeverity(str, Enum):
+    WARNING = "warning"
+    ERROR = "error"
+    CRITICAL = "critical"
+
+
+class PlanViolation(BaseModel):
+    code: str
+    severity: ViolationSeverity
+    validator: str
+    message: str
+    suggested_status: PlanValidationStatus
+    step_id: int | None = None
+    field: str | None = None
+    retryable: bool = False
+
+
+class PlanValidationResult(BaseModel):
+    status: PlanValidationStatus
+    passed: bool
+    violations: list[PlanViolation] = Field(default_factory=list)
+    warnings: list[PlanViolation] = Field(default_factory=list)
+    plan_hash: str
+    registry_version: str
+    policy_version: str
+
+
+class ToolObservation(BaseModel):
+    tool_call_id: str
+    run_id: str | None = None
+    step_id: int
+    tool_name: str
+    action: str
+    status: ToolCallStatus
+    attempts: int = 0
+    duration_ms: float = 0.0
+    output: Any = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+class TaskExecutionResult(BaseModel):
+    status: TaskExecutionStatus
+    observations: list[ToolObservation] = Field(default_factory=list)
+    terminal_outputs: dict[int, Any] = Field(default_factory=dict)
 
 
 class PlanningResult(BaseModel):
@@ -327,6 +408,7 @@ class PlanningResult(BaseModel):
     intent: IntentType
     confidence: float = Field(ge=0.0, le=1.0)
     entities: ExtractedEntities
+    metadata_query_mode: MetadataQueryMode | None = None
     task_steps: list[TaskStep] = Field(default_factory=list)
     need_clarification: bool = False
     clarification_question: str | None = None
@@ -342,3 +424,9 @@ class PlanningResult(BaseModel):
     notes: list[str] = Field(default_factory=list)
     normalized_terms: list[NormalizedTerm] = Field(default_factory=list)
     normalization_traces: list[NormalizationTrace] = Field(default_factory=list)
+    execution_status: TaskExecutionStatus | None = None
+    tool_observations: list[ToolObservation] = Field(default_factory=list)
+    final_output: Any = None
+    plan_validation: PlanValidationResult | None = None
+    replan_required: bool = False
+    approval_required: bool = False

@@ -21,6 +21,7 @@ class AuthorizationProvider(Protocol):
         resource: dict[str, Any],
     ) -> AuthorizationDecision:
         """Evaluate whether a subject may perform an action on a data resource."""
+        ...
 
 
 class RolePolicy(BaseModel):

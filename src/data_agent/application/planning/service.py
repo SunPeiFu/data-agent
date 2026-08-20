@@ -20,6 +20,40 @@ def plan_question(
     max_clarification_rounds: int = 3,
 ) -> PlanningResult:
     """Start one planning run under an authenticated access context."""
+    return _start_question(
+        question,
+        access_context,
+        thread_id=thread_id,
+        max_clarification_rounds=max_clarification_rounds,
+        execute_requested=False,
+    )
+
+
+def run_question(
+    question: str,
+    access_context: AccessContext | None = None,
+    *,
+    thread_id: str | None = None,
+    max_clarification_rounds: int = 3,
+) -> PlanningResult:
+    """Plan and execute one question through registered tools."""
+    return _start_question(
+        question,
+        access_context,
+        thread_id=thread_id,
+        max_clarification_rounds=max_clarification_rounds,
+        execute_requested=True,
+    )
+
+
+def _start_question(
+    question: str,
+    access_context: AccessContext | None,
+    *,
+    thread_id: str | None,
+    max_clarification_rounds: int,
+    execute_requested: bool,
+) -> PlanningResult:
     app = get_planning_graph()
     workflow_thread_id = thread_id or f"thread-{uuid4().hex}"
     config = {"configurable": {"thread_id": workflow_thread_id}}
@@ -35,6 +69,7 @@ def plan_question(
             "clarification_history": [],
             "confirmed_slots": [],
             "processed_idempotency_keys": [],
+            "execute_requested": execute_requested,
         },
         config=config,
     )

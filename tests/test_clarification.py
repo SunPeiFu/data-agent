@@ -141,7 +141,7 @@ def test_resume_clarification_revalidates_selected_table_and_builds_plan() -> No
     assert resumed.handoff_required is False
     assert resumed.entities.table is not None
     assert resumed.entities.table.raw == selected.value
-    assert len(resumed.task_steps) == 3
+    assert len(resumed.task_steps) == 2
     assert resumed.clarification_history[0].source == "user_confirmed"
     assert resumed.clarification_history[0].confidence == 1.0
     assert "跳过原问题中的表术语候选扩展" in "\n".join(resumed.notes)

@@ -5,7 +5,7 @@ import json
 from uuid import uuid4
 
 from data_agent.domain.models import AccessContext, ClarificationResponse
-from data_agent.application.planning.service import plan_question, resume_clarification
+from data_agent.application.planning.service import plan_question, resume_clarification, run_question
 
 
 def main() -> None:
@@ -16,6 +16,11 @@ def main() -> None:
     plan_parser.add_argument("question", help="用户自然语言问题")
     plan_parser.add_argument("--user-id", default="demo-user", help="鉴权用户标识")
     plan_parser.add_argument("--role", action="append", dest="roles", help="用户角色，可重复传入")
+
+    run_parser = subparsers.add_parser("run", help="生成计划并执行已注册工具")
+    run_parser.add_argument("question", help="用户自然语言问题")
+    run_parser.add_argument("--user-id", default="demo-user", help="鉴权用户标识")
+    run_parser.add_argument("--role", action="append", dest="roles", help="用户角色，可重复传入")
 
     resume_parser = subparsers.add_parser("resume", help="提交澄清回答并恢复原 LangGraph 会话")
     resume_parser.add_argument("--thread-id", required=True, help="澄清卡片中的 thread_id")
@@ -28,6 +33,16 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "plan":
         result = plan_question(
+            args.question,
+            access_context=AccessContext(
+                user_id=args.user_id,
+                roles=args.roles or ["data_admin"],
+                tenant_id="demo",
+            ),
+        )
+        print(json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2))
+    elif args.command == "run":
+        result = run_question(
             args.question,
             access_context=AccessContext(
                 user_id=args.user_id,

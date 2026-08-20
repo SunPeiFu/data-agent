@@ -15,6 +15,8 @@
 
 ```text
 src/data_agent/
+├── application/execution/
+│   └── nodes.py       # TaskStep DAG 执行与 Observation 收集节点
 ├── application/planning/
 │   ├── graph.py       # LangGraph 节点注册、edge 和 conditional edge
 │   ├── state.py       # PlannerState 状态契约
@@ -33,12 +35,13 @@ src/data_agent/
 │   ├── llm_analyzer.py
 │   └── llm_client.py
 ├── infrastructure/
-│   ├── repositories/ # MySQL / Milvus Adapter
+│   ├── repositories/ # MySQL / Milvus / Neo4j Adapter
 │   ├── security/     # Authorization Provider
 │   ├── persistence/  # LangGraph Checkpointer
 │   └── observability/# Trace Recorder
 ├── config/           # 环境配置和稳定项目路径
 ├── interfaces/       # CLI；未来 FastAPI 也放在这里
+├── tools/            # LangChain Tool、强类型契约、Registry 和 Executor
 ├── __init__.py       # 稳定的 Python 公共 API
 └── cli.py            # python -m data_agent.cli 兼容入口
 ```
@@ -61,6 +64,7 @@ infrastructure
 3. `service.py` 负责一次用例的输入、恢复和返回，不维护节点细节。
 4. `infrastructure` 实现外部系统访问；Planner 通过稳定类或 Protocol 使用这些能力。
 5. 根包只暴露稳定公共 API，测试内部细节时从实际所属模块导入。
+6. `tools` 依赖 Repository Protocol/实现完成真实调用；Planner 只产生 TaskStep，不直接持有 Tool。
 
 ## 面试表达
 

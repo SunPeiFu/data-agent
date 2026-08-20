@@ -2,7 +2,13 @@
 
 ## 1. 目标与边界
 
-本次改造聚焦表级数据资产定位。`resolve_metadata_candidates` 的职责是把用户问题中的技术表名、业务术语或业务描述转换为经过事实源校验的候选表，不负责执行血缘查询，也不负责生成最终答案。
+本次改造聚焦需要唯一目标表的资产定位。`resolve_metadata_candidates` 的职责是把用户问题中的技术表名、业务术语或业务描述转换为经过事实源校验的候选表，不负责执行血缘查询，也不负责生成最终答案。
+
+元数据查询先由 `determine_metadata_query_mode` 分类：
+
+- `discovery`：用户期望得到一批表，例如“支付相关表有哪些”。Planner 跳过候选查询，由执行阶段运行 `filter_tables + semantic_search + merge_and_rank`，多结果不澄清。
+- `detail`：用户要读取某张表的详情，例如“dwd.orderInfo 的表说明和负责人”。Planner 必须先解析唯一表，多候选进入澄清，随后执行 `get_table_detail`。
+- `lineage_search/impact_analysis`：天然要求唯一入口表，始终进入候选解析。
 
 核心原则：
 
@@ -23,7 +29,9 @@
 
 ```mermaid
 flowchart TD
-    A["normalized entities"] --> B{"技术表名确定性"}
+    A["normalized entities"] --> M{"metadata query mode"}
+    M -->|"discovery"| N["跳过候选解析，交给执行阶段检索集合"]
+    M -->|"detail 或血缘/影响"| B{"技术表名确定性"}
     B -->|"两段式/三段式"| C["MySQL 精确校验"]
     B -->|"一段式"| D["MySQL 候选解析"]
     D --> E{"是否命中"}

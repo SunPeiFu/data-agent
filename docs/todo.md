@@ -6,7 +6,7 @@
 
 - [ ] 跑通三个核心 CLI case，确认 `intent/entities/task_steps/notes` 都能看懂。
 - [ ] 按顺序阅读 `application/planning/`，理解企业级 DAG：
-  `classify_intent -> extract_entities -> normalize_entities -> validate_slots -> resolve_metadata_candidates -> authorize_context -> post_validate_slots -> decide_clarification_or_continue -> build_task_plan/return_clarification_result/return_forbidden_result -> validate_task_plan -> attach_trace -> return_planning_result`
+  `classify_intent -> extract_entities -> normalize_entities -> determine_metadata_query_mode -> validate_slots -> resolve_metadata_candidates -> authorize_context -> post_validate_slots -> decide_clarification_or_continue -> build_task_plan/return_clarification_result/return_forbidden_result -> validate_task_plan -> attach_trace -> return_planning_result`
 - [ ] 重点理解 `hybrid_router.py` 的候选合并模型：
   `RuleEvidence -> FieldCandidate -> ResolvedField -> EntityResolution`
 - [ ] 重点理解 `domain/task_builder.py` 的三类计划模板：
@@ -25,33 +25,41 @@
 
 ## P1：补真实工具接入
 
-- [ ] 建立 `ToolRegistry`，注册工具名、action、输入 schema、输出 schema、超时、重试策略和权限 scope。
-- [ ] 接入 TiDB 元数据工具：
-  - [ ] `filter_tables`
-  - [x] `resolve_table` 候选解析已先用 MySQL `meta_table` / `meta_table_ext` 落地。
+- [x] 建立 `ToolRegistry`，注册工具名、action、输入 schema、输出 schema、超时、重试策略和权限 scope。
+- [x] 接入 TiDB/MySQL 元数据工具：
+  - [x] `filter_tables`
+  - [x] `get_table_detail`
+  - [x] `resolve_metadata_candidates` 候选解析已先用 MySQL `meta_table` / `meta_table_ext` 落地。
   - [x] 支持一段式、两段式、三段式表名解析。
   - [x] 支持表级业务术语到候选物理表的解析。
 - [ ] 完成 Milvus 表资产数据同步与执行闭环（Collection Schema 和查询 Repository 已完成）：
   - [x] 实现 `MilvusMetadataRepository.hybrid_search` 查询接口。
   - [ ] 将表说明、表级业务术语及 embedding 增量同步到 Collection。
   - [x] 增加 hybrid search：Dense + BM25 + 结构化过滤 + RRF。
+  - [x] 封装 `semantic_search` LangChain Tool，并对召回结果执行 MySQL 事实回查。
   - [ ] 增加离线召回评测集、阈值标定和线上检索指标。
-- [ ] 接入 Neo4j 血缘工具：
-  - [ ] `lineage_search(direction=upstream/downstream/both)`
-  - [ ] 支持 `depth`
-  - [ ] 支持表级血缘。
+- [x] 实现 Neo4j 血缘 Repository 和 LangChain Tool：
+  - [x] `lineage_search(direction=upstream/downstream/both)`
+  - [x] 支持 `depth=1..5`
+  - [x] 支持表级血缘。
+- [ ] 准备生产 Neo4j 实例、索引、真实血缘同步任务和集成测试数据。
+- [ ] MCP 动态工具发现暂不实现：后续增加 `MCPToolProvider`，通过 `tools/list` 同步远程工具，并与本地 Registry 合并、缓存和处理 `tools/list_changed`。
 - [ ] 后续把 MySQL 版 `resolve_metadata_candidates` 替换为真实 TiDB / 数据目录查询。
 - [ ] 元数据模型补充 platform/environment/tenant 后，将三者加入候选身份一致性和权限域校验。
 - [ ] 将当前 YAML `AuthorizationProvider` 替换为企业 IAM/Ranger/统一权限中心，并在 TiDB、Milvus、Neo4j 工具执行端二次鉴权。
 
 ## P2：补 LangGraph 执行闭环
 
-- [ ] 继续增强 `validate_task_plan` 的生产校验：
-  - [ ] 校验工具 output schema 和下游 input schema 是否匹配。
-  - [ ] 校验权限 scope 是否满足每个工具 action。
-  - [ ] 校验每个 step 是否具备 timeout、retry、fallback 策略。
-  - [ ] 校验 cost budget、并发上限和查询深度是否符合业务策略。
-  - [ ] 校验 trace_id、planner_version、rule evidence、entity resolution 是否完整落审计。
+- [x] 将 `validate_task_plan` 从 notes 提示升级为结构化执行闸门：
+  - [x] 校验工具 output schema 和下游 input binding 是否匹配。
+  - [x] 校验意图权限和每个工具 action 的权限 scope。
+  - [x] 校验每个 step 是否具备 timeout、retry、scope 和 version 策略。
+  - [x] 输出 `PlanValidationResult/PlanViolation`、稳定 reason code 和处置状态。
+  - [x] 通过 conditional edge 对非 approved 计划 fail closed。
+  - [x] 固化 plan hash、Registry 版本和 Policy 版本，并在执行前防篡改复核。
+- [ ] 继续增强计划治理策略：校验全局 cost/token budget、并发上限和租户配额。
+- [ ] 校验 trace_id、planner_version、rule evidence、entity resolution evidence 是否完整落审计。
+- [ ] 为 `approval_required` 增加独立 HITL 审批卡片、`interrupt/Command(resume)`、审批人权限、过期时间和幂等协议；当前所有已注册工具均为 read-only。
 - [x] 给 `decide_clarification_or_continue` 增加 conditional edge：
   - [x] 缺槽位 -> `return_clarification_result`
   - [x] 多候选 -> `return_clarification_result`
@@ -59,16 +67,19 @@
   - [x] 澄清问题跨 pre/post 去重并按槽位依赖排序。
   - [x] 返回结构化候选卡片并保留 pending issues。
   - [x] 信息充分 -> `build_task_plan`
-- [ ] 增加 `execute_task_plan` 节点，根据 `TaskStep.depends_on` 执行工具。
-- [ ] 增加并行执行能力：
-  - [ ] 相同 `parallel_group` 的步骤并行执行。
-  - [ ] 失败时能隔离单个工具错误。
-- [ ] 增加 `collect_observations` 节点，统一收集 TiDB/Milvus/Neo4j 工具结果。
+- [x] 增加 `execute_task_plan` 节点，根据 `TaskStep.depends_on` 执行工具。
+- [ ] 执行阶段引入 `ResolvedTableRef(table_id/full_name/metadata_version/resolved_at)`；当计划进入队列或执行耗时较长时，通过独立的 `validate_table_snapshot` 校验元数据版本，避免重新做候选解析。
+- [x] 增加并行执行能力：
+  - [x] 同一 ready wave 的无依赖步骤通过 asyncio 并行执行。
+  - [x] 失败时隔离单个工具错误，聚合工具可按策略接收降级输入。
+- [x] 增加 `collect_observations` 节点，统一收集 TiDB/Milvus/Neo4j 工具结果。
 - [ ] 增加 `replan_or_continue` 节点：
   - [ ] 表名候选过多 -> 澄清
   - [ ] 查询无结果 -> 改写 query 或扩大检索范围
   - [ ] 工具失败 -> 重试或降级
-- [ ] 增加失败重试、超时、限流和降级策略。
+- [ ] 继续增强执行治理：
+  - [x] 工具级失败重试、超时和允许失败依赖降级策略。
+  - [ ] 分布式限流、熔断、隔离舱和全局 cost budget。
 
 ## P3：补结果生成和业务闭环
 

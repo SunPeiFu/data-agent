@@ -1,0 +1,10 @@
+{
+  "include": ["src"],
+  "exclude": ["tests"],
+  "extraPaths": ["src"],
+  "venvPath": "/Users/sunpeifualiyun.com/miniconda3/envs",
+  "venv": "python-agent",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportTypedDictNotRequiredAccess": "none"
+}

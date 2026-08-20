@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 from hashlib import sha256
 from time import perf_counter
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, get_origin
 from uuid import uuid4
 
 from langgraph.types import interrupt
@@ -33,6 +33,7 @@ from data_agent.domain.models import (
     LineageDirection,
     MetadataCandidateEvidence,
     MetadataCandidateSource,
+    MetadataQueryMode,
     MetadataValidationStatus,
     NormalizationTrace,
     NormalizedTerm,
@@ -41,6 +42,9 @@ from data_agent.domain.models import (
     NodeTrace,
     OperationType,
     PlanningResult,
+    PlanValidationResult,
+    PlanValidationStatus,
+    PlanViolation,
     SlotIssue,
     SlotIssueType,
     SlotValidationResult,
@@ -48,11 +52,14 @@ from data_agent.domain.models import (
     TableIdentifier,
     TraceContext,
     TraceEvent,
+    ViolationSeverity,
 )
 from data_agent.domain.normalization import load_normalization_config
+from data_agent.domain.plan_validation import compute_plan_hash
 from data_agent.domain.slot_rules import load_slot_rule_config
 from data_agent.domain.task_builder import build_task_plan
 from data_agent.infrastructure.observability.trace_recorder import TraceRecorder, get_trace_recorder
+from data_agent.tools.factory import get_default_tool_registry
 
 
 PLANNER_VERSION = "v1-enterprise-planner"
@@ -229,6 +236,39 @@ def _normalize_entities(state: PlannerState) -> PlannerState:
     }
 
 
+def _determine_metadata_query_mode(state: PlannerState) -> PlannerState:
+    """Classify whether metadata intent expects a result set or one canonical table.
+
+    `discovery` means the candidate list is the final business result and must not trigger
+    clarification. `detail` means downstream execution needs one trusted physical table, so it
+    must pass metadata resolution and post-validation first.
+    """
+    if state.get("intent") != IntentType.METADATA_SEARCH:
+        return {
+            "metadata_query_mode": None,
+            "metadata_query_mode_notes": ["元数据查询模式: 非 metadata_search，无需分类。"],
+        }
+
+    question = state["question"]
+    entities = state["entities"]
+    discovery_patterns = (
+        r"有哪些(?:表|数据表)",
+        r"(?:表|数据资产)(?:中)?有哪些",
+        r"包含哪些(?:表|数据资产)",
+        r"(?:搜索|查找|推荐|列出|筛选).*(?:表|数据资产)",
+        r"(?:相关|有关|类似).*(?:表|数据资产)",
+        r"(?:哪些|多少)(?:张|个)?(?:表|数据资产)",
+    )
+    is_discovery = any(re.search(pattern, question, re.IGNORECASE) for pattern in discovery_patterns)
+    has_target_asset_signal = entities.table is not None or bool(state.get("table_term_candidates"))
+    mode = MetadataQueryMode.DETAIL if has_target_asset_signal and not is_discovery else MetadataQueryMode.DISCOVERY
+    reason = "命中集合型资产检索表达" if mode == MetadataQueryMode.DISCOVERY else "存在明确目标表且未命中集合型表达"
+    return {
+        "metadata_query_mode": mode,
+        "metadata_query_mode_notes": [f"元数据查询模式: mode={mode.value}，reason={reason}。"],
+    }
+
+
 def _validate_slots(state: PlannerState) -> PlannerState:
     """Pre-metadata slot validation.
 
@@ -313,14 +353,18 @@ def _post_validate_slots(state: PlannerState) -> PlannerState:
             )
         )
 
-    # 对血缘/影响分析来说，候选表必须唯一且具备可审计的事实验证证据。
-    if intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS}:
+    # 血缘、影响分析和单表详情都必须得到唯一且具备可审计事实证据的物理表。
+    requires_unique_table = intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS} or (
+        intent == IntentType.METADATA_SEARCH
+        and state.get("metadata_query_mode") == MetadataQueryMode.DETAIL
+    )
+    if requires_unique_table:
         if not table_candidates:
             issues.append(
                 _slot_issue(
                     slot_name="table",
                     issue_type=SlotIssueType.MISSING,
-                    message="血缘查询或影响分析缺少表元数据候选。",
+                    message="当前任务缺少唯一目标表的元数据候选。",
                 )
             )
         elif len(table_candidates) > 1:
@@ -369,6 +413,20 @@ def _resolve_metadata_candidates(state: PlannerState) -> PlannerState:
     """
     entities = state["entities"]
     requested_table = entities.table.model_copy(deep=True) if entities.table else None
+
+    # 集合型资产发现的候选就是最终执行结果，不能在 Planner 中提前检索并再次执行。
+    if (
+        state.get("intent") == IntentType.METADATA_SEARCH
+        and state.get("metadata_query_mode") == MetadataQueryMode.DISCOVERY
+    ):
+        return {
+            "metadata_candidates": {},
+            "metadata_candidate_profiles": {},
+            "metadata_candidate_evidence": {},
+            "metadata_notes": ["元数据候选解析: discovery 模式跳过，资产集合由执行阶段检索。"],
+            "requested_table": requested_table,
+        }
+
     candidates: dict[str, list[str]] = {}
     candidate_profiles: dict[str, dict[str, str | None]] = {}
     candidate_evidence: dict[str, MetadataCandidateEvidence] = {}
@@ -663,11 +721,13 @@ def _build_task_plan(state: PlannerState) -> PlannerState:
         intent=state.get("intent", IntentType.UNKNOWN),
         confidence=state.get("confidence", 0.0),
         entities=state["entities"],
+        metadata_query_mode=state.get("metadata_query_mode"),
     )
     # 📌 此种写法是什么意思  增加*的 拆解数组
     result.notes = [
         *state.get("routing_notes", []),
         *state.get("normalization_notes", []),
+        *state.get("metadata_query_mode_notes", []),
         *_slot_validation_notes(state),
         *state.get("metadata_notes", []),
         *state.get("authorization_notes", []),
@@ -707,6 +767,7 @@ def _return_clarification_result(state: PlannerState) -> PlannerState:
         intent=state.get("intent", IntentType.UNKNOWN),
         confidence=min(state.get("confidence", 0.0), 0.62),
         entities=state["entities"],
+        metadata_query_mode=state.get("metadata_query_mode"),
         task_steps=[],
         need_clarification=True,
         clarification_question=clarification_request.question,
@@ -716,6 +777,7 @@ def _return_clarification_result(state: PlannerState) -> PlannerState:
         notes=[
             *state.get("routing_notes", []),
             *state.get("normalization_notes", []),
+            *state.get("metadata_query_mode_notes", []),
             *_slot_validation_notes(state),
             *state.get("metadata_notes", []),
             *state.get("authorization_notes", []),
@@ -736,12 +798,14 @@ def _return_forbidden_result(state: PlannerState) -> PlannerState:
         intent=state.get("intent", IntentType.UNKNOWN),
         confidence=min(state.get("confidence", 0.0), 0.5),
         entities=state["entities"],
+        metadata_query_mode=state.get("metadata_query_mode"),
         task_steps=[],
         need_clarification=False,
         clarification_question=None,
         notes=[
             *state.get("routing_notes", []),
             *state.get("normalization_notes", []),
+            *state.get("metadata_query_mode_notes", []),
             *_slot_validation_notes(state),
             *state.get("metadata_notes", []),
             *state.get("authorization_notes", []),
@@ -768,6 +832,7 @@ def _return_handoff_result(state: PlannerState) -> PlannerState:
         intent=state.get("intent", IntentType.UNKNOWN),
         confidence=min(state.get("confidence", 0.0), 0.5),
         entities=state["entities"],
+        metadata_query_mode=state.get("metadata_query_mode"),
         task_steps=[],
         need_clarification=False,
         clarification_question=None,
@@ -778,6 +843,7 @@ def _return_handoff_result(state: PlannerState) -> PlannerState:
         notes=[
             *state.get("routing_notes", []),
             *state.get("normalization_notes", []),
+            *state.get("metadata_query_mode_notes", []),
             *_slot_validation_notes(state),
             *state.get("metadata_notes", []),
             *state.get("authorization_notes", []),
@@ -947,28 +1013,37 @@ def _merge_clarification_answer(
 
 
 def _validate_task_plan(state: PlannerState) -> PlannerState:
-    """Validate generated task plan before returning it.
-
-    生产级 check_task_plan 不能只看工具名，还要覆盖：
-    1. DAG 结构
-    2. 工具 action 注册关系
-    3. 参数 schema
-    4. intent 与工具组合契约
-    5. 元数据候选状态
-    6. 执行策略边界
-    """
+    """Compile a structured policy decision that acts as the execution gate."""
     result = state["result"]
-    notes = [
+    findings = [
         *_validate_dag_structure(result),
         *_validate_tool_actions(result),
         *_validate_action_params(result),
+        *_validate_dataflow_contracts(result),
         *_validate_intent_tool_contract(result),
         *_validate_metadata_resolution_status(state),
+        *_validate_tool_access(state),
+        *_validate_tool_runtime_policies(result),
         *_validate_execution_policy(result),
     ]
-    if not notes:
-        notes.append("计划校验: DAG、工具 action、参数 schema、意图契约、元数据状态和执行策略均通过。")
-    return {"plan_validation_notes": notes}
+    violations = [item for item in findings if item.severity != ViolationSeverity.WARNING]
+    warnings = [item for item in findings if item.severity == ViolationSeverity.WARNING]
+    registry = get_default_tool_registry()
+    validation = PlanValidationResult(
+        status=_resolve_plan_validation_status(violations),
+        passed=not violations,
+        violations=violations,
+        warnings=warnings,
+        plan_hash=compute_plan_hash(result),
+        registry_version=registry.version,
+        policy_version=registry.policy_version,
+    )
+    result.plan_validation = validation
+    return {
+        "plan_validation": validation,
+        "plan_validation_notes": _plan_validation_notes(validation),
+        "result": result,
+    }
 
 
 def _attach_trace(state: PlannerState) -> PlannerState:
@@ -991,7 +1066,19 @@ def _attach_trace(state: PlannerState) -> PlannerState:
         node_name="attach_trace",
         event_type="RUN_FINALIZED",
         reason_code=run_status.value,
-        attributes={"planner_decision": state.get("planner_decision", "continue")},
+        attributes={
+            "planner_decision": state.get("planner_decision", "continue"),
+            "plan_validation_status": (
+                state["plan_validation"].status.value if state.get("plan_validation") else None
+            ),
+            "plan_hash": state["plan_validation"].plan_hash if state.get("plan_validation") else None,
+            "registry_version": (
+                state["plan_validation"].registry_version if state.get("plan_validation") else None
+            ),
+            "policy_version": (
+                state["plan_validation"].policy_version if state.get("plan_validation") else None
+            ),
+        },
         created_at=_utc_now(),
     )
     recorder = get_trace_recorder()
@@ -1019,6 +1106,10 @@ def _resolve_trace_run_status(state: PlannerState) -> AgentRunStatus:
         "clarify": AgentRunStatus.INTERRUPTED,
         "forbidden": AgentRunStatus.FORBIDDEN,
         "handoff": AgentRunStatus.HANDOFF,
+        "replan_required": AgentRunStatus.REPLAN_REQUIRED,
+        "validation_failed": AgentRunStatus.VALIDATION_FAILED,
+        "validation_clarification": AgentRunStatus.INTERRUPTED,
+        "approval_required": AgentRunStatus.APPROVAL_REQUIRED,
     }.get(decision, AgentRunStatus.COMPLETED)
 
 
@@ -1026,32 +1117,12 @@ def _return_planning_result(state: PlannerState) -> PlannerState:
     return {"result": state["result"]}
 
 
-TOOL_ACTION_REGISTRY: dict[tuple[str, str], dict[str, Any]] = {
-    ("tidb_metadata", "filter_tables"): {"required": [], "allowed": {"biz_line", "domain", "data_layer", "topic_keywords"}},
-    ("tidb_metadata", "resolve_table"): {
-        "required": ["table"],
-        "allowed": {"biz_line", "domain", "data_layer", "table", "table_parts_count"},
-    },
-    ("milvus_rag", "semantic_search"): {"required": ["query", "top_k"], "allowed": {"query", "top_k"}},
-    ("neo4j_lineage", "lineage_search"): {
-        "required": ["table", "direction", "depth"],
-        "allowed": {"table", "direction", "depth", "lineage_granularity"},
-    },
-    ("impact_analyzer", "classify_impact"): {"required": ["operation", "direction"], "allowed": {"operation", "direction"}},
-    ("impact_analyzer", "merge_lineage_and_metadata"): {
-        "required": ["operation", "direction"],
-        "allowed": {"operation", "direction"},
-    },
-    ("result_ranker", "merge_and_rank"): {"required": ["rank_by"], "allowed": {"rank_by"}},
-}
-
-
-def _validate_dag_structure(result: PlanningResult) -> list[str]:
-    notes: list[str] = []
+def _validate_dag_structure(result: PlanningResult) -> list[PlanViolation]:
+    violations: list[PlanViolation] = []
     step_ids = [step.step_id for step in result.task_steps]
     duplicate_step_ids = sorted({step_id for step_id in step_ids if step_ids.count(step_id) > 1})
     if duplicate_step_ids:
-        notes.append(f"计划校验: step_id 重复 {duplicate_step_ids}。")
+        violations.append(_violation("PLAN_DUPLICATE_STEP_ID", "dag", f"step_id 重复 {duplicate_step_ids}。"))
 
     step_id_set = set(step_ids)
     invalid_dependencies = [
@@ -1060,111 +1131,393 @@ def _validate_dag_structure(result: PlanningResult) -> list[str]:
         if any(dependency not in step_id_set for dependency in step.depends_on)
     ]
     if invalid_dependencies:
-        notes.append(f"计划校验: 存在非法依赖步骤 {invalid_dependencies}。")
+        violations.append(_violation("PLAN_INVALID_DEPENDENCY", "dag", f"存在非法依赖步骤 {invalid_dependencies}。"))
+
+    invalid_bindings = [
+        step.step_id
+        for step in result.task_steps
+        if any(source not in step.depends_on for source in step.input_bindings.values())
+    ]
+    if invalid_bindings:
+        violations.append(
+            _violation("PLAN_BINDING_NOT_DEPENDENCY", "dag", f"input_bindings 未声明为 depends_on {invalid_bindings}。")
+        )
 
     if _has_cycle(result):
-        notes.append("计划校验: depends_on 存在循环依赖。")
-    if not notes:
-        notes.append("计划校验: DAG 结构通过。")
-    return notes
+        violations.append(_violation("PLAN_DAG_CYCLE", "dag", "depends_on 存在循环依赖。"))
+    return violations
 
 
-def _validate_tool_actions(result: PlanningResult) -> list[str]:
-    notes: list[str] = []
-    unknown_actions = [
-        f"{step.tool_name}.{step.action}"
-        for step in result.task_steps
-        if (step.tool_name, step.action) not in TOOL_ACTION_REGISTRY
-    ]
-    if unknown_actions:
-        notes.append(f"计划校验: 存在未注册工具 action {unknown_actions}。")
-    else:
-        notes.append("计划校验: 工具 action 注册关系通过。")
-    return notes
-
-
-def _validate_action_params(result: PlanningResult) -> list[str]:
-    notes: list[str] = []
+def _validate_tool_actions(result: PlanningResult) -> list[PlanViolation]:
+    violations: list[PlanViolation] = []
+    registry = get_default_tool_registry()
     for step in result.task_steps:
-        schema = TOOL_ACTION_REGISTRY.get((step.tool_name, step.action))
-        if not schema:
+        try:
+            registry.get(step.tool_name, step.action)
+        except KeyError:
+            violations.append(
+                _violation(
+                    "PLAN_TOOL_NOT_REGISTERED",
+                    "tool_registry",
+                    f"工具未注册: {step.tool_name}.{step.action}。",
+                    step_id=step.step_id,
+                )
+            )
+    return violations
+
+
+def _validate_action_params(result: PlanningResult) -> list[PlanViolation]:
+    violations: list[PlanViolation] = []
+    registry = get_default_tool_registry()
+    for step in result.task_steps:
+        try:
+            definition = registry.get(step.tool_name, step.action)
+        except KeyError:
             continue
-        missing = [key for key in schema["required"] if _is_missing_param(step.params.get(key))]
-        extra = sorted(set(step.params) - schema["allowed"])
+        input_fields = definition.input_schema.model_fields
+        supplied_fields = set(step.params) | set(step.input_bindings)
+        missing = [
+            name
+            for name, field in input_fields.items()
+            if field.is_required() and name not in supplied_fields
+        ]
+        extra = sorted(supplied_fields - set(input_fields))
         if missing:
-            notes.append(f"计划校验: step {step.step_id} 缺少必填参数 {missing}。")
+            violations.append(
+                _violation("PLAN_TOOL_INPUT_MISSING", "input_schema", f"缺少必填参数 {missing}。", step_id=step.step_id)
+            )
         if extra:
-            notes.append(f"计划校验: step {step.step_id} 存在未声明参数 {extra}。")
-        notes.extend(_validate_param_values(step.step_id, step.params))
-    if not notes:
-        notes.append("计划校验: 参数 schema 通过。")
-    return notes
+            violations.append(
+                _violation("PLAN_TOOL_INPUT_EXTRA", "input_schema", f"存在未声明参数 {extra}。", step_id=step.step_id)
+            )
+        if not missing and not extra:
+            try:
+                partial_input = {**step.params, **{name: {} for name in step.input_bindings}}
+                definition.input_schema.model_validate(partial_input)
+            except Exception as exc:
+                violations.append(
+                    _violation(
+                        "PLAN_TOOL_INPUT_SCHEMA_INVALID",
+                        "input_schema",
+                        f"输入 schema 不兼容: {str(exc)[:300]}。",
+                        step_id=step.step_id,
+                    )
+                )
+        violations.extend(_validate_param_values(step.step_id, step.params))
+    return violations
 
 
-def _validate_intent_tool_contract(result: PlanningResult) -> list[str]:
+def _validate_intent_tool_contract(result: PlanningResult) -> list[PlanViolation]:
     actions = {(step.tool_name, step.action) for step in result.task_steps}
+    registry = get_default_tool_registry()
+    incompatible: list[str] = []
+    for step in result.task_steps:
+        try:
+            definition = registry.get(step.tool_name, step.action)
+        except KeyError:
+            continue
+        if result.intent not in definition.intents:
+            incompatible.append(f"{step.tool_name}.{step.action}")
+    if incompatible:
+        return [
+            _violation(
+                "PLAN_TOOL_INTENT_NOT_ALLOWED",
+                "intent_contract",
+                f"intent={result.intent.value} 不允许工具 {sorted(incompatible)}。",
+            )
+        ]
+
+    if result.intent == IntentType.METADATA_SEARCH:
+        metadata_mode = result.metadata_query_mode or MetadataQueryMode.DISCOVERY
+        if metadata_mode == MetadataQueryMode.DETAIL:
+            required = {("tidb_metadata", "get_table_detail")}
+        else:
+            required = {
+                ("tidb_metadata", "filter_tables"),
+                ("milvus_rag", "semantic_search"),
+                ("result_ranker", "merge_and_rank"),
+            }
+        missing = sorted(f"{tool}.{action}" for tool, action in required - actions)
+        if missing:
+            return [_violation("PLAN_INTENT_TOOL_CONTRACT", "intent_contract", f"metadata mode={metadata_mode.value} 缺少工具 {missing}。")]
+        return []
+
     required_by_intent = {
-        IntentType.METADATA_SEARCH: {
-            ("tidb_metadata", "filter_tables"),
-            ("milvus_rag", "semantic_search"),
-            ("result_ranker", "merge_and_rank"),
-        },
         IntentType.LINEAGE_SEARCH: {
-            ("tidb_metadata", "resolve_table"),
             ("neo4j_lineage", "lineage_search"),
         },
         IntentType.IMPACT_ANALYSIS: {
-            ("tidb_metadata", "resolve_table"),
             ("neo4j_lineage", "lineage_search"),
         },
     }
     required = required_by_intent.get(result.intent, set())
     missing = sorted(f"{tool}.{action}" for tool, action in required - actions)
     if missing:
-        return [f"计划校验: intent={result.intent.value} 缺少必要工具组合 {missing}。"]
-    return [f"计划校验: intent={result.intent.value} 工具组合契约通过。"]
+        return [_violation("PLAN_INTENT_TOOL_CONTRACT", "intent_contract", f"intent={result.intent.value} 缺少工具 {missing}。")]
+    return []
 
 
-def _validate_metadata_resolution_status(state: PlannerState) -> list[str]:
+def _validate_dataflow_contracts(result: PlanningResult) -> list[PlanViolation]:
+    """Validate that every binding targets a declared dict/model input on a registered tool."""
+    registry = get_default_tool_registry()
+    steps = {step.step_id: step for step in result.task_steps}
+    violations: list[PlanViolation] = []
+    for step in result.task_steps:
+        try:
+            target = registry.get(step.tool_name, step.action)
+        except KeyError:
+            continue
+        target_fields = target.input_schema.model_fields
+        for input_name, source_id in step.input_bindings.items():
+            source_step = steps.get(source_id)
+            if source_step is None:
+                violations.append(
+                    _violation("PLAN_DATAFLOW_SOURCE_MISSING", "dataflow", f"绑定了不存在的 step {source_id}。", step_id=step.step_id, field=input_name)
+                )
+                continue
+            field = target_fields.get(input_name)
+            if field is None:
+                violations.append(
+                    _violation("PLAN_DATAFLOW_TARGET_MISSING", "dataflow", f"不存在绑定输入 {input_name}。", step_id=step.step_id, field=input_name)
+                )
+                continue
+            try:
+                registry.get(source_step.tool_name, source_step.action)
+            except KeyError:
+                continue
+            if get_origin(field.annotation) is not dict and field.annotation not in {dict, Any}:
+                violations.append(
+                    _violation(
+                        "PLAN_DATAFLOW_TYPE_MISMATCH",
+                        "dataflow",
+                        f"{input_name} 不能接收上游结构化输出。",
+                        step_id=step.step_id,
+                        field=input_name,
+                    )
+                )
+    return violations
+
+
+def _validate_tool_access(state: PlannerState) -> list[PlanViolation]:
+    """Ensure every planned tool remains discoverable under intent and user access context."""
+    result = state["result"]
+    context = state.get("access_context")
+    if context is None:
+        return [
+            _violation(
+                "PLAN_ACCESS_CONTEXT_MISSING",
+                "authorization",
+                "缺少工具权限上下文。",
+                suggested_status=PlanValidationStatus.FORBIDDEN,
+            )
+        ]
+    # Re-authorization must use the canonical metadata resource, including business attributes
+    # that were not necessarily present in the user's wording.
+    authorization_entities = _entities_with_resolved_resource_context(state, result.entities)
+    registry = get_default_tool_registry()
+    if not registry.is_intent_authorized(result.intent, context, authorization_entities):
+        return [
+            _violation(
+                "PLAN_INTENT_ACCESS_DENIED",
+                "authorization",
+                f"当前身份不可执行意图 {result.intent.value}。",
+                suggested_status=PlanValidationStatus.FORBIDDEN,
+            )
+        ]
+
+    denied: list[str] = []
+    for step in result.task_steps:
+        try:
+            definition = registry.get(step.tool_name, step.action)
+        except KeyError:
+            # Unknown tools are planner/registry defects, not authorization denials.
+            continue
+        if result.intent not in definition.intents:
+            continue
+        if not registry.is_authorized(definition, context, authorization_entities):
+            denied.append(f"{step.tool_name}.{step.action}")
+    if denied:
+        return [
+            _violation(
+                "PLAN_TOOL_ACCESS_DENIED",
+                "authorization",
+                f"当前身份不可使用工具 {denied}。",
+                suggested_status=PlanValidationStatus.FORBIDDEN,
+            )
+        ]
+    return []
+
+
+def _entities_with_resolved_resource_context(
+    state: PlannerState,
+    entities: ExtractedEntities,
+) -> ExtractedEntities:
+    """Enrich authorization input from the authoritative metadata candidate profile.
+
+    The planner keeps user extraction and metadata facts separate. The execution gate combines
+    them only for policy evaluation so a missing business line in the question does not turn a
+    previously authorized canonical table into a false denial.
+    """
+    table = entities.table.raw if entities.table else None
+    profile = state.get("metadata_candidate_profiles", {}).get(table or "", {})
+    updates: dict[str, Any] = {}
+    if entities.biz_line is None and profile.get("biz_line"):
+        updates["biz_line"] = profile["biz_line"]
+    if entities.domain is None and profile.get("domain"):
+        try:
+            updates["domain"] = DomainType(profile["domain"])
+        except ValueError:
+            pass
+    return entities.model_copy(update=updates) if updates else entities
+
+
+def _validate_tool_runtime_policies(result: PlanningResult) -> list[PlanViolation]:
+    """Require execution governance metadata for every registered tool in the plan."""
+    registry = get_default_tool_registry()
+    violations: list[PlanViolation] = []
+    for step in result.task_steps:
+        try:
+            definition = registry.get(step.tool_name, step.action)
+        except KeyError:
+            continue
+        if definition.side_effect_level != "read_only":
+            violations.append(
+                _violation(
+                    "PLAN_TOOL_APPROVAL_REQUIRED",
+                    "tool_policy",
+                    f"工具 {step.tool_name}.{step.action} 具有副作用等级 {definition.side_effect_level}。",
+                    step_id=step.step_id,
+                    suggested_status=PlanValidationStatus.APPROVAL_REQUIRED,
+                )
+            )
+        if (
+            definition.timeout_seconds <= 0
+            or definition.retry_policy.max_attempts < 1
+            or not definition.required_scope
+            or not definition.version
+        ):
+            violations.append(
+                _violation(
+                    "PLAN_TOOL_POLICY_INCOMPLETE",
+                    "tool_policy",
+                    f"工具 {step.tool_name}.{step.action} 缺少 timeout/retry/scope/version 策略。",
+                    step_id=step.step_id,
+                    suggested_status=PlanValidationStatus.REJECTED,
+                )
+            )
+    return violations
+
+
+def _validate_metadata_resolution_status(state: PlannerState) -> list[PlanViolation]:
     result = state["result"]
     candidates = state.get("metadata_candidates", {})
-    notes: list[str] = []
-    if result.intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS}:
+    violations: list[PlanViolation] = []
+    requires_unique_table = result.intent in {IntentType.LINEAGE_SEARCH, IntentType.IMPACT_ANALYSIS} or (
+        result.intent == IntentType.METADATA_SEARCH
+        and result.metadata_query_mode == MetadataQueryMode.DETAIL
+    )
+    if requires_unique_table:
         table_candidates = candidates.get("table", [])
         if not table_candidates:
-            notes.append("计划校验: 血缘/影响分析缺少表元数据候选。")
+            violations.append(
+                _violation(
+                    "PLAN_METADATA_TARGET_MISSING",
+                    "metadata_gate",
+                    "唯一目标表任务缺少元数据候选。",
+                    suggested_status=PlanValidationStatus.CLARIFICATION_REQUIRED,
+                )
+            )
         elif len(table_candidates) > 1:
-            notes.append("计划校验: 表元数据候选不唯一，生产环境应先澄清或消歧。")
-        else:
-            notes.append("计划校验: 表元数据候选状态通过。")
+            violations.append(
+                _violation(
+                    "PLAN_METADATA_TARGET_AMBIGUOUS",
+                    "metadata_gate",
+                    "表元数据候选不唯一，需要先澄清或消歧。",
+                    suggested_status=PlanValidationStatus.CLARIFICATION_REQUIRED,
+                )
+            )
+    return violations
 
-    if not notes:
-        notes.append("计划校验: 当前计划无需额外元数据候选校验。")
-    return notes
 
-
-def _validate_execution_policy(result: PlanningResult) -> list[str]:
-    notes: list[str] = []
+def _validate_execution_policy(result: PlanningResult) -> list[PlanViolation]:
+    violations: list[PlanViolation] = []
     for step in result.task_steps:
         depth = step.params.get("depth")
         top_k = step.params.get("top_k")
         if isinstance(depth, int) and not 1 <= depth <= 5:
-            notes.append(f"计划校验: step {step.step_id} depth={depth} 超出允许范围 1-5。")
+            violations.append(
+                _violation("PLAN_DEPTH_LIMIT_EXCEEDED", "execution_policy", f"depth={depth} 超出范围 1-5。", step_id=step.step_id, field="depth", suggested_status=PlanValidationStatus.REJECTED)
+            )
         if isinstance(top_k, int) and not 1 <= top_k <= 50:
-            notes.append(f"计划校验: step {step.step_id} top_k={top_k} 超出允许范围 1-50。")
-    if not notes:
-        notes.append("计划校验: 执行策略边界通过。")
-    return notes
+            violations.append(
+                _violation("PLAN_TOP_K_LIMIT_EXCEEDED", "execution_policy", f"top_k={top_k} 超出范围 1-50。", step_id=step.step_id, field="top_k", suggested_status=PlanValidationStatus.REJECTED)
+            )
+    return violations
 
 
-def _validate_param_values(step_id: int, params: dict[str, Any]) -> list[str]:
-    notes: list[str] = []
+def _validate_param_values(step_id: int, params: dict[str, Any]) -> list[PlanViolation]:
+    violations: list[PlanViolation] = []
     direction = params.get("direction")
     if direction is not None and direction not in {"upstream", "downstream", "both"}:
-        notes.append(f"计划校验: step {step_id} direction={direction} 非法。")
+        violations.append(_violation("PLAN_DIRECTION_INVALID", "parameter_policy", f"direction={direction} 非法。", step_id=step_id, field="direction"))
     rank_by = params.get("rank_by")
     if rank_by is not None and not isinstance(rank_by, list):
-        notes.append(f"计划校验: step {step_id} rank_by 必须是 list。")
+        violations.append(_violation("PLAN_RANK_BY_INVALID", "parameter_policy", "rank_by 必须是 list。", step_id=step_id, field="rank_by"))
+    return violations
+
+
+def _violation(
+    code: str,
+    validator: str,
+    message: str,
+    *,
+    step_id: int | None = None,
+    field: str | None = None,
+    suggested_status: PlanValidationStatus = PlanValidationStatus.REPLAN_REQUIRED,
+    severity: ViolationSeverity = ViolationSeverity.ERROR,
+    retryable: bool = False,
+) -> PlanViolation:
+    return PlanViolation(
+        code=code,
+        severity=severity,
+        validator=validator,
+        message=message,
+        suggested_status=suggested_status,
+        step_id=step_id,
+        field=field,
+        retryable=retryable,
+    )
+
+
+def _resolve_plan_validation_status(violations: list[PlanViolation]) -> PlanValidationStatus:
+    """Select the safest remediation when independent validators report multiple failures.
+
+    Security denial is terminal. Structural/policy rejection and replanning take precedence over
+    asking a user to clarify or approve, because approval must never bless an invalid plan.
+    """
+    if not violations:
+        return PlanValidationStatus.APPROVED
+    priority = {
+        PlanValidationStatus.APPROVAL_REQUIRED: 10,
+        PlanValidationStatus.CLARIFICATION_REQUIRED: 20,
+        PlanValidationStatus.REPLAN_REQUIRED: 30,
+        PlanValidationStatus.REJECTED: 40,
+        PlanValidationStatus.FORBIDDEN: 50,
+        PlanValidationStatus.APPROVED: 0,
+    }
+    return max((item.suggested_status for item in violations), key=priority.__getitem__)
+
+
+def _plan_validation_notes(validation: PlanValidationResult) -> list[str]:
+    notes = [
+        f"计划校验: status={validation.status.value}, passed={validation.passed}, "
+        f"violations={len(validation.violations)}, warnings={len(validation.warnings)}。",
+        f"计划校验证据: plan_hash={validation.plan_hash[:16]}, "
+        f"registry_version={validation.registry_version}, policy_version={validation.policy_version}。",
+    ]
+    for item in [*validation.violations, *validation.warnings]:
+        location = f", step={item.step_id}" if item.step_id is not None else ""
+        notes.append(f"计划校验问题: code={item.code}, severity={item.severity.value}{location}, message={item.message}")
     return notes
 
 
@@ -1222,7 +1575,7 @@ def _filter_table_candidates_by_context(candidates: list[str], entities: Extract
     return filtered or candidates
 
 
-MOCK_TABLE_PROFILES: dict[str, dict[str, str]] = {
+MOCK_TABLE_PROFILES: dict[str, dict[str, str | None]] = {
     "dwd.orderInfo": {"domain": DomainType.TRANSACTION.value, "data_layer": DataLayer.DWD.value, "biz_line": "安逸花"},
     "dwd.order_info": {"domain": DomainType.TRANSACTION.value, "data_layer": DataLayer.DWD.value, "biz_line": "安逸花"},
     "dwd.payment_detail": {"domain": DomainType.MARKETING.value, "data_layer": DataLayer.DWD.value, "biz_line": "安逸花"},

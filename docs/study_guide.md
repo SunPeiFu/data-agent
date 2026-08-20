@@ -10,7 +10,7 @@
 - TiDB、Milvus、Neo4j 三类工具分别负责什么。
 - 意图识别、实体抽取、任务拆解分别解决什么问题。
 - 为什么血缘查询统一是 `lineage_search`，上下游用 `direction` 参数控制。
-- 为什么一段式表名必须先 `resolve_table`。
+- 为什么一段式表名必须先经过 `resolve_metadata_candidates`，且解析完成后不应在执行计划中重复查询。
 - 三个面试 case 最终会生成什么执行计划。
 
 ## 第 0 小时：准备环境和跑通项目
@@ -204,8 +204,8 @@ src/data_agent/domain/task_builder.py
 2. `_metadata_steps`
 3. `_lineage_steps`
 4. `_impact_steps`
-5. `_resolve_table_step`
-6. `_validate_slots`
+5. `_validate_slots`
+6. `_resolve_metadata_candidates`
 
 你要背住三种计划模板。
 
@@ -242,7 +242,6 @@ TiDB 负责结构化过滤业务线、主题域、分层；Milvus 负责语义�
 计划：
 
 ```text
-tidb_metadata.resolve_table
 neo4j_lineage.lineage_search(direction=downstream)
 impact_analyzer.classify_impact
 ```
@@ -250,7 +249,7 @@ impact_analyzer.classify_impact
 讲法：
 
 ```text
-先 resolve 表，避免表名不规范导致查错；再用 Neo4j 查下游血缘；最后按直接影响和间接影响做分级。
+Planner 前置的 resolve_metadata_candidates 已完成表消歧并写回标准表名；执行计划直接用 Neo4j 查下游血缘，最后按直接影响和间接影响做分级，避免重复访问元数据服务。
 ```
 
 ### 模板 3：上下游双向影响分析
@@ -264,7 +263,6 @@ impact_analyzer.classify_impact
 计划：
 
 ```text
-tidb_metadata.resolve_table
 neo4j_lineage.lineage_search(direction=both)
 milvus_rag.semantic_search
 impact_analyzer.merge_lineage_and_metadata
@@ -273,7 +271,7 @@ impact_analyzer.merge_lineage_and_metadata
 讲法：
 
 ```text
-一段式表名 userInfo 不能直接判定唯一，所以先通过 TiDB 结合营销域和 DWD 分层定位候选表。表定位后，Neo4j 查询双向血缘，同时 Milvus 补充业务语义，最后融合成影响分析结果。
+一段式表名 userInfo 不能直接判定唯一，所以建计划前通过元数据 Repository 结合营销域和 DWD 分层定位候选表。表定位后，Neo4j 与 Milvus 作为无依赖的输入步骤并行执行，最后融合成影响分析结果。
 ```
 
 这一小时的目标：
@@ -298,6 +296,7 @@ src/data_agent/application/planning/
 classify_intent
   -> extract_entities
   -> normalize_entities
+  -> determine_metadata_query_mode
   -> validate_slots
   -> resolve_metadata_candidates
   -> authorize_context
@@ -310,7 +309,7 @@ classify_intent
 面试讲法：
 
 ```text
-我用 LangGraph 把 Agent Planner 显式建模成状态图。当前版本已经把槽位校验、元数据候选解析、权限校验和澄清决策拆成独立节点，并通过 conditional edge 控制继续规划、澄清或拒绝；后续可以继续接真实工具执行、失败重试、trace 日志和并行节点。
+我用 LangGraph 把 Agent Planner 显式建模成状态图。元数据查询会先区分 discovery 和 detail：批量资产发现不在 Planner 阶段重复检索，单表详情必须先完成唯一资产解析。当前版本已经把模式判定、槽位校验、元数据候选解析、权限校验和澄清决策拆成独立节点，并通过 conditional edge 控制继续规划、澄清或拒绝。
 ```
 
 不要在这一小时纠结 LangGraph 高级语法。面试里重点不是炫框架，而是说明你知道为什么用状态图组织 Agent 流程。
@@ -354,7 +353,7 @@ pytest -q
 ```text
 我做的是一个面向数据资产探查的 Agent Planner。用户输入自然语言后，系统先做意图识别，区分元数据查询、血缘查询和变更影响分析；然后做实体抽取，提取业务线、主题域、数仓分层、表名、操作类型和血缘方向；最后由任务拆解模块生成工具调用计划。
 
-比如用户问“营销域下的 DWD 层 userInfo 表修改，关联影响的上游和下游表有哪些”，系统会识别为 impact_analysis，direction 是 both。因为 userInfo 是一段式表名，所以第一步必须调用 TiDB 元数据工具 resolve_table；表定位后调用 Neo4j 的 lineage_search(direction=both) 查双向血缘，同时调用 Milvus 做表说明和业务语义召回，最后由 impact_analyzer 合并血缘和元数据语义。
+比如用户问“营销域下的 DWD 层 userInfo 表修改，关联影响的上游和下游表有哪些”，系统会识别为 impact_analysis，direction 是 both。因为 userInfo 是一段式表名，Planner 会先在 resolve_metadata_candidates 节点结合主题域和分层完成元数据消歧；任务计划直接调用 Neo4j 的 lineage_search(direction=both)，同时调用 Milvus 做表说明和业务语义召回，最后由 impact_analyzer 合并血缘和元数据语义。
 ```
 
 再准备 5 个追问答案。

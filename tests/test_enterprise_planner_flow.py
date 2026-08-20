@@ -1,4 +1,4 @@
-from data_agent.domain.models import IntentType
+from data_agent.domain.models import IntentType, PlanValidationStatus
 from data_agent.application.planning.service import plan_question
 from data_agent.domain.slot_rules import load_slot_rule_config
 
@@ -10,12 +10,12 @@ def test_enterprise_planner_notes_include_metadata_auth_validation_and_trace() -
     assert "元数据候选解析" in notes
     assert "权限校验" in notes
     assert "澄清决策" in notes
-    assert "计划校验: DAG 结构通过。" in notes
-    assert "计划校验: 工具 action 注册关系通过。" in notes
-    assert "计划校验: 参数 schema 通过。" in notes
-    assert "计划校验: intent=impact_analysis 工具组合契约通过。" in notes
-    assert "计划校验: 表元数据候选状态通过。" in notes
-    assert "计划校验: 执行策略边界通过。" in notes
+    assert result.plan_validation is not None
+    assert result.plan_validation.status == PlanValidationStatus.APPROVED
+    assert result.plan_validation.passed is True
+    assert result.plan_validation.violations == []
+    assert "计划校验: status=approved" in notes
+    assert "registry_version=local-tools-v1" in notes
     assert "Trace: trace_id=trace-" in notes
     assert ", run_id=run-" in notes
     assert "run_status=completed" in notes

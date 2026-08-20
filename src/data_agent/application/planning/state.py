@@ -10,15 +10,18 @@ from data_agent.domain.models import (
     ClarificationAnswerRecord,
     ExtractedEntities,
     IntentType,
+    MetadataQueryMode,
     MetadataCandidateEvidence,
     NodeTrace,
     NormalizationTrace,
     NormalizedTerm,
     PlanningResult,
+    PlanValidationResult,
     SlotValidationResult,
     TableIdentifier,
     TraceContext,
     TraceEvent,
+    TaskExecutionResult,
 )
 from data_agent.intelligence.hybrid_router import HybridRouteResult
 
@@ -38,6 +41,7 @@ class PlannerState(TypedDict, total=False):
     authorization_notes: list[str]
     clarification_notes: list[str]
     plan_validation_notes: list[str]
+    plan_validation: PlanValidationResult
     trace_notes: list[str]
     trace_context: TraceContext
     node_traces: list[NodeTrace]
@@ -52,6 +56,8 @@ class PlannerState(TypedDict, total=False):
     clarification_history: list[ClarificationAnswerRecord]
     confirmed_slots: list[str]
     processed_idempotency_keys: list[str]
+    execute_requested: bool
+    task_execution_result: TaskExecutionResult
     metadata_candidates: dict[str, list[str]]
     metadata_candidate_profiles: dict[str, dict[str, str | None]]
     metadata_candidate_evidence: dict[str, MetadataCandidateEvidence]
@@ -62,6 +68,8 @@ class PlannerState(TypedDict, total=False):
     authorization_decisions: list[AuthorizationDecision]
     trace_id: str
     intent: IntentType
+    metadata_query_mode: MetadataQueryMode | None
+    metadata_query_mode_notes: list[str]
     confidence: float
     entities: ExtractedEntities
     result: PlanningResult
